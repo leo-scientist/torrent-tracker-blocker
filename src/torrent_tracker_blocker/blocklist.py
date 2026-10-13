@@ -1,18 +1,17 @@
 """Build the rule file from tracker lists and load it into the firewall."""
 
+import ipaddress
 import logging
 from collections.abc import Sequence
 from pathlib import Path
 
 from torrent_tracker_blocker.firewall import apply_rules
+from torrent_tracker_blocker.measures import NO_MEASURES, Measures
 from torrent_tracker_blocker.parser import build_rules
-from torrent_tracker_blocker.rules import TrackerRule, read_rules, without_excluded, write_rules
+from torrent_tracker_blocker.rules import IpNetwork, TrackerRule, read_rules, without_excluded, write_rules
 from torrent_tracker_blocker.sources import HTTPS_PREFIX, read_networks, read_source
 
 logger = logging.getLogger(__name__)
-
-# Cloudflare addresses are shared with a huge number of unrelated sites.
-CLOUDFLARE_RANGES = ("https://www.cloudflare.com/ips-v4", "https://www.cloudflare.com/ips-v6")
 
 
 def _download_rules(sources: Sequence[str], allow_private: bool) -> list[TrackerRule]:
@@ -24,18 +23,29 @@ def _download_rules(sources: Sequence[str], allow_private: bool) -> list[Tracker
     return list(dict.fromkeys(rules))
 
 
+def _whitelisted_networks(whitelist: Sequence[str]) -> list[IpNetwork]:
+    """Resolve the whitelist: an entry is an address or a range itself, or a list of them to read."""
+    networks: list[IpNetwork] = []
+
+    for entry in whitelist:
+        try:
+            networks.append(ipaddress.ip_network(entry, strict=False))
+        except ValueError:
+            networks += read_networks(entry)
+
+    return networks
+
+
 def refresh_rule_file(
     output: Path,
     sources: Sequence[str],
     *,
-    excludes: Sequence[str] = (),
-    block_cloudflare: bool = False,
+    whitelist: Sequence[str] = (),
     merge: bool = False,
     allow_private: bool = False,
 ) -> bool:
     """Write a fresh rule file; False if there is nothing to block."""
-    exclude_sources = excludes if block_cloudflare else [*CLOUDFLARE_RANGES, *excludes]
-    networks = [network for source in exclude_sources for network in read_networks(source)]
+    networks = _whitelisted_networks(whitelist)
     rules = without_excluded(_download_rules(sources, allow_private), networks)
 
     if not rules:
@@ -54,14 +64,14 @@ def refresh_rule_file(
     return True
 
 
-def load_rule_file(path: Path, chain: str, allow_private: bool = False) -> bool:
-    """Replace the firewall rules with those from a rule file; False if it has none."""
+def load_rule_file(path: Path, chain: str, allow_private: bool = False, measures: Measures = NO_MEASURES) -> bool:
+    """Replace the firewall rules with those from a rule file and the measures; False if it has no rules."""
     rules = read_rules(path, allow_private)
     if not rules:
         logger.error("No rules found in %s; firewall not changed", path)
         return False
 
-    apply_rules(chain, rules)
+    apply_rules(chain, rules, measures)
     logger.info("Applied %d rules to chains %s-*", len(rules), chain)
 
     return True

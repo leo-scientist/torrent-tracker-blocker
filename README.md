@@ -7,6 +7,10 @@ It downloads public lists of working trackers, resolves them to IP addresses
 and loads `DROP` rules for them into dedicated iptables and ip6tables chains. A systemd timer
 keeps the list current. The command is called `tracker-blocker`.
 
+Optional [additional measures](#additional-measures) also drop the BitTorrent
+traffic that no tracker list covers, such as DHT and connections between
+peers.
+
 ## Quick start
 
 On the Linux host, as a user with `sudo` (Debian/Ubuntu also need the
@@ -37,12 +41,14 @@ Check that it works with `sudo tracker-blocker status`; undo everything with
 
 Read these before relying on the tool:
 
-- **Trackers only.** Clients can still find peers through DHT, PEX and
-  trackers that are not on the lists. This makes torrenting harder, not
-  impossible.
-- **Trackers behind Cloudflare stay reachable.** Their addresses are shared
-  with a huge number of unrelated sites, so they are excluded by default; see
-  `--block-cloudflare`. That is about one in seven of the listed trackers.
+- **Trackers only, unless you ask for more.** Clients can still find peers
+  through DHT, PEX and trackers that are not on the lists. The
+  [additional measures](#additional-measures) close part of that gap, but
+  encrypted BitTorrent traffic stays invisible to them. All of this makes
+  torrenting harder, not impossible.
+- **Trackers behind Cloudflare stay reachable by default.** Their addresses
+  are shared with a huge number of unrelated sites, so they are on the default
+  [whitelist](#whitelist). That is about one in seven of the listed trackers.
 - **Third-party lists.** The lists decide what gets blocked. See
   [Safety](#safety) for what they can and cannot do to the host.
 
@@ -53,6 +59,9 @@ Read these before relying on the tool:
   everything except `parse`. Both the nft and the legacy backend work.
 - `ip6tables` for IPv6. If it is not installed, or the kernel has no IPv6
   support, only IPv4 trackers are blocked and `update` says so in a warning.
+- For the [additional measures](#additional-measures), the `string`,
+  `connlimit` and `conntrack` matches of iptables, which stock distribution
+  kernels provide. If one is missing, `update` fails and changes nothing.
 
 On distributions that use nftables, `iptables` is the `iptables-nft` front
 end: the rules are stored in nftables (`table ip filter` and
@@ -80,18 +89,21 @@ accept `-c`/`--chain CHAIN` to use chains other than `tracker-blocker-*`.
 ### update
 
 ```sh
-sudo tracker-blocker update [-i SOURCE]... [-x SOURCE]... [--block-cloudflare]
-                             [--allow-private] [--merge] [-o OUTPUT] [-c CHAIN]
+sudo tracker-blocker update [-i SOURCE]... [-w [ADDRESSES ...]] [--allow-private]
+                             [--merge] [-o OUTPUT] [-c CHAIN] [--config FILE]
+                             [--signatures SCOPE] [--connection-limit SCOPE]
+                             [--max-connections N]
 ```
 
 | Option | Meaning |
 |---|---|
 | `-i`, `--input SOURCE` | List of tracker URLs: a local file or an `https://` URL. Repeatable. |
-| `-x`, `--exclude SOURCE` | Addresses that must never be blocked: a local file or an `https://` URL. Repeatable. |
-| `--block-cloudflare` | Do not exclude Cloudflare's addresses. |
+| `-w`, `--whitelist [ADDRESSES ...]` | Addresses that must never be blocked, see [Whitelist](#whitelist). Repeatable. |
 | `--allow-private` | Accept private addresses from local files, see [Safety](#safety). |
 | `-m`, `--merge` | Add the new rules to the existing rule file instead of replacing it. |
 | `-o`, `--output OUTPUT` | Rule file to write (default `/var/lib/torrent-tracker-blocker/trackers.csv`). |
+| `--config FILE` | [Configuration file](#configuration) to read instead of the default one. |
+| `--signatures`, `--connection-limit`, `--max-connections` | See [Additional measures](#additional-measures). |
 
 **Sources.** Without `-i` two public lists are used, both refreshed at least
 daily:
@@ -106,13 +118,6 @@ not resolve and addresses that must not be blocked are skipped with a warning.
 To add your own trackers, pass the public lists and your file together:
 `-i https://... -i /etc/torrent-tracker-blocker/trackers.txt`.
 
-**Exclusions.** An exclusion list has one IPv4 or IPv6 address or CIDR range
-per line; `#` starts a comment. Lists given with `-x` are used in addition to
-Cloudflare's published ranges (<https://www.cloudflare.com/ips-v4> and
-<https://www.cloudflare.com/ips-v6>), which are always excluded unless
-`--block-cloudflare` is given. With that option every
-unrelated site on the same Cloudflare address and port becomes unreachable too.
-
 **Replace or merge.** By default the rule file is replaced, so trackers that
 moved or died are unblocked on the next run. With `--merge` the previous rules
 are kept and the new ones added. Merging survives lists and DNS that fluctuate
@@ -120,9 +125,10 @@ between runs, but nothing is ever removed: stale addresses pile up and
 eventually block whoever owns them next. Delete the file from time to time if
 you use it.
 
-**Failures.** If a list cannot be downloaded, an exclusion list is invalid or
-nothing can be blocked (for example because DNS is down), the command fails
-and leaves both the rule file and the firewall as they were.
+**Failures.** If a list cannot be downloaded, the whitelist or the
+configuration is invalid, or nothing can be blocked (for example because DNS
+is down), the command fails and leaves both the rule file and the firewall as
+they were.
 
 ### status
 
@@ -139,18 +145,32 @@ IPv6 tracker-blocker-forward: 32 rules, 57 packets dropped
 The exit code is 0 only if all chains are installed and receive traffic: three
 for IPv4 and, where IPv6 is available, three for IPv6.
 
+A chain with [additional measures](#additional-measures) also shows what each
+of them dropped:
+
+```
+IPv4 tracker-blocker-forward: 80 rules, 340 packets dropped, 1200 more by signatures, 15 more by the connection limit
+```
+
 ### parse and apply
 
 `update` is `parse` followed by `apply`. Run them separately to build the rule
 file on another machine or to inspect it before it reaches the firewall:
 
 ```sh
-tracker-blocker parse [the options of update, except -c] [-o trackers.csv]
-sudo tracker-blocker apply -i trackers.csv [--allow-private] [-c CHAIN]
+tracker-blocker parse [-i SOURCE]... [-w [ADDRESSES ...]] [--allow-private] [--merge]
+                      [-o trackers.csv] [--config FILE]
+sudo tracker-blocker apply -i trackers.csv [--allow-private] [-c CHAIN] [--config FILE]
+                           [--signatures SCOPE] [--connection-limit SCOPE]
+                           [--max-connections N]
 ```
 
+The whitelist belongs to `parse`: it decides what gets into the rule file. The
+additional measures belong to `apply`: they are firewall rules of their own.
+
 `apply` creates the chains `CHAIN-input`, `CHAIN-output` and `CHAIN-forward`
-in both iptables and ip6tables, fills them with `DROP` rules and jumps to them
+in both iptables and ip6tables, fills them with `DROP` rules for the trackers
+and for the enabled measures, and jumps to them
 from the top of `INPUT`, `OUTPUT` and `FORWARD`, so existing `ACCEPT` rules
 cannot bypass the block list.
 
@@ -159,6 +179,96 @@ single `iptables-restore` transaction: an invalid rule file or an iptables
 error leaves its firewall exactly as it was, and rules outside these chains
 are never touched. IPv4 is applied first; if the IPv6 transaction then fails,
 the command reports the error and IPv6 keeps its previous rules.
+
+## Configuration
+
+Settings that the daily update and the restore at boot must share live in
+`/etc/torrent-tracker-blocker/config.toml`. The file is optional, and whatever
+it leaves out keeps its default:
+
+```toml
+# Addresses that never get a blocking rule. Replaces the default, so keep
+# the Cloudflare lists here unless you want those addresses blocked too.
+whitelist = [
+    "https://www.cloudflare.com/ips-v4",
+    "https://www.cloudflare.com/ips-v6",
+    "/etc/torrent-tracker-blocker/whitelist.txt",
+    "203.0.113.7",
+]
+
+[signatures]
+scope = "forward"
+
+[connection_limit]
+scope = "forward"
+max_connections = 200
+```
+
+`--config FILE` reads another file instead. A command line option overrides
+the setting of the same name. An unknown option or a value that cannot be used
+fails the command before anything is downloaded or changed.
+
+### Whitelist
+
+Addresses on the whitelist never get a blocking rule, whatever the tracker
+lists say. An entry is one of:
+
+- an IPv4 or IPv6 address, such as `203.0.113.7`;
+- a CIDR range, such as `198.51.100.0/24` or `2001:db8::/32`;
+- a list of them: a local file or an `https://` URL with one address or range
+  per line, where `#` starts a comment.
+
+The default whitelist is the address ranges that Cloudflare publishes
+(<https://www.cloudflare.com/ips-v4> and <https://www.cloudflare.com/ips-v6>).
+A content delivery network serves a huge number of unrelated sites from the
+same addresses, so a rule for a tracker behind one makes every site on that
+address and port unreachable.
+
+Nothing ties the tool to Cloudflare, though: `whitelist` in the configuration
+file replaces the default. Add the published ranges of other providers, the
+servers the host depends on (DNS resolvers, monitoring, your own services), or
+set `whitelist = []` to whitelist nothing. `-w`/`--whitelist` does the same
+from the command line and replaces the configured list; without a value it
+whitelists nothing.
+
+The whitelist is applied when the rule file is written, so `apply` loads a
+rule file as it is. It only decides which addresses get a tracker rule: the
+additional measures recognise BitTorrent by what a packet contains, not by
+where it goes.
+
+## Additional measures
+
+Blocking the listed trackers never touches other traffic. The measures below
+also catch what the lists miss, but each of them can hit legitimate traffic
+too, so they are off until you enable them.
+
+| Measure | What it drops | What it costs |
+|---|---|---|
+| `signatures` | Unencrypted BitTorrent packets, wherever they go: peer handshakes (TCP and uTP), DHT queries, connection requests to UDP trackers and announces to HTTP trackers. | The start of every packet is searched, which takes CPU time on a busy gateway. Another program's packet that happens to begin with the same bytes is dropped as well. Encrypted peer connections and HTTPS trackers are not seen. |
+| `connection_limit` | New connections of an address that already has more than `max_connections` open, counting every protocol together. | It slows torrents down instead of blocking them, and it slows down everything else that opens many connections at once: several devices behind one address, download managers, crawlers. |
+
+Each measure has a `scope`:
+
+| Scope | Traffic it applies to |
+|---|---|
+| `off` | None; the default. |
+| `forward` | Only what the host forwards for others, such as the clients of a VPN server. The host's own traffic is left alone. |
+| `all` | Forwarded traffic and the host itself: signatures in the packets it sends and receives, the limit for the connections it opens. Connections that others open to the host are never limited, so a server running on it keeps its clients. |
+
+Details worth knowing:
+
+- The connection limit is per source address and only refuses new
+  connections: the ones that are already established keep working.
+- `max_connections` has no default, because the right number depends on what
+  your clients do: a browser keeps a few dozen connections open, a torrent
+  client hundreds. Enabling the limit without it is an error.
+- Traffic between the host and its own addresses is exempt from every measure.
+- The measures cover IPv4 and IPv6 alike.
+- `status` shows what each measure dropped, which helps to see whether it
+  earns its cost before and after you enable it.
+
+On the command line: `--signatures SCOPE`, `--connection-limit SCOPE` and
+`--max-connections N`, accepted by `update` and `apply`.
 
 ## Automatic updates
 
@@ -169,13 +279,15 @@ The units in [`systemd/`](systemd) are installed in the quick start:
 | `tracker-blocker-update.timer` | Runs `tracker-blocker update --quiet` once a day. |
 | `tracker-blocker-restore.service` | Loads the saved rule file at boot, because iptables rules do not survive a reboot. |
 
-To change the options, for example to add an exclusion list, override the
-command with `sudo systemctl edit tracker-blocker-update.service`:
+Both units read the [configuration file](#configuration), so the whitelist
+and the additional measures are set there. For the other options, for example
+a tracker list of your own, override the command with
+`sudo systemctl edit tracker-blocker-update.service`:
 
 ```ini
 [Service]
 ExecStart=
-ExecStart=/usr/local/bin/tracker-blocker update --quiet -x /etc/torrent-tracker-blocker/exclude.txt
+ExecStart=/usr/local/bin/tracker-blocker update --quiet -i /etc/torrent-tracker-blocker/trackers.txt
 ```
 
 Failed runs show up in `systemctl --failed` and
@@ -215,8 +327,8 @@ What a list can never do:
 What a list can still do: block any *other* public address and port. A hostile
 entry such as `udp://8.8.8.8:53` would block that DNS resolver for the host
 and for forwarded clients. Put the addresses the host depends on (DNS
-resolvers, monitoring, your own services) into an exclusion list, and only add
-sources you trust.
+resolvers, monitoring, your own services) on the [whitelist](#whitelist), and
+only add sources you trust.
 
 **Blocking private addresses on purpose.** A tracker inside your own network,
 such as an ISP's `retracker.local`, has a private address. To block it, list
@@ -262,6 +374,8 @@ inside a throwaway container.
 src/torrent_tracker_blocker/
 ├── cli.py        command line interface
 ├── blocklist.py  build the rule file and load it into the firewall
+├── config.py     the configuration file: whitelist and measures
+├── measures.py   optional measures and their scopes
 ├── sources.py    read lists from files and https:// URLs
 ├── parser.py     tracker URLs -> rules (DNS resolution)
 ├── rules.py      rule model, validation and CSV I/O

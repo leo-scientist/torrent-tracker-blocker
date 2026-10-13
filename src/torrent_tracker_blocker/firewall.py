@@ -1,4 +1,4 @@
-"""Sync tracker rules into dedicated iptables and ip6tables chains.
+"""Sync tracker rules and the optional measures into dedicated iptables and ip6tables chains.
 
 Every change to one IP version is one ``iptables-restore --noflush``
 transaction: its firewall ends up either fully updated or untouched, and rules
@@ -11,11 +11,12 @@ import re
 import shlex
 import shutil
 import subprocess
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from itertools import pairwise
 from pathlib import Path
 
+from torrent_tracker_blocker.measures import NO_MEASURES, Measures, Scope
 from torrent_tracker_blocker.rules import TrackerRule
 
 logger = logging.getLogger(__name__)
@@ -26,6 +27,27 @@ CHAIN_PREFIX_PATTERN = re.compile(r"[A-Za-z0-9_.-]{1,20}")
 JUMP_FLAGS = ("-j", "-g")
 # Present whenever the kernel has an IPv6 stack, even if no interface uses it.
 IPV6_STACK = Path("/proc/net/if_inet6")
+# What gives BitTorrent away in a packet that is not encrypted. Every signature opens the payload,
+# so only the start of a packet is searched: --to counts from the IP header and is wide enough
+# for IPv6 with TCP options. kmp, unlike bm, also finds a signature that is split between buffers.
+SIGNATURE_MATCHES = (
+    # Peer handshake, over TCP or uTP.
+    '-m string --hex-string "|13|BitTorrent protocol" --algo kmp --to 128',
+    # DHT query.
+    '-p udp -m string --string "d1:ad2:id20:" --algo kmp --to 64',
+    # Connection request to a UDP tracker: the magic number of the protocol and the "connect" action.
+    '-p udp -m string --hex-string "|000004172710198000000000|" --algo kmp --to 64',
+    # Announce to an HTTP tracker, wherever the parameter stands in the URL.
+    '-p tcp -m string --string "info_hash=" --algo kmp --to 512',
+)
+# Only connections that are being opened are counted against the limit and dropped: the ones
+# that are already established keep working. The limit is per source address.
+CONNECTION_LIMIT_MATCH = "-m conntrack --ctstate NEW -m connlimit --connlimit-above {limit} --connlimit-saddr"
+# The chains of the host itself that a measure covers when its scope is not limited to forwarded
+# traffic. Connections are limited where they are opened from, so not in INPUT: a limit there
+# would cap how many clients a server on this host can have.
+SIGNATURE_HOST_CHAINS = ("INPUT", "OUTPUT")
+CONNECTION_LIMIT_HOST_CHAINS = ("OUTPUT",)
 
 
 class FirewallError(Exception):
@@ -55,6 +77,9 @@ class ChainStatus:
     dropped_packets: int
     # False when nothing jumps to the chain from its built-in chain, so it sees no traffic.
     is_active: bool
+    # Packets dropped by each optional measure; None when the chain does not have it.
+    signature_drops: int | None = None
+    connection_limit_drops: int | None = None
 
 
 def chain_name(prefix: str, builtin: str) -> str:
@@ -85,8 +110,34 @@ def _delete_jumps(current_rules: str, chains: Sequence[str]) -> list[str]:
     return ["-D" + line.removeprefix("-A") for line in current_rules.splitlines() if _jumps_to(line, chains)]
 
 
-def build_apply_script(current_rules: str, prefix: str, rules: Sequence[TrackerRule]) -> str:
-    """Build iptables-restore input that replaces our chains with the given rules.
+def _measure_chains(prefix: str, scope: Scope, host_builtins: Sequence[str]) -> list[str]:
+    """Our chains that a measure with this scope adds its rules to."""
+    if scope is Scope.OFF:
+        return []
+
+    builtins = ("FORWARD",) if scope is Scope.FORWARD else (*host_builtins, "FORWARD")
+    return [chain_name(prefix, builtin) for builtin in builtins]
+
+
+def _measure_commands(prefix: str, measures: Measures) -> list[str]:
+    commands = [
+        f"-A {chain} {match} -j DROP"
+        for chain in _measure_chains(prefix, measures.signatures, SIGNATURE_HOST_CHAINS)
+        for match in SIGNATURE_MATCHES
+    ]
+    limit = CONNECTION_LIMIT_MATCH.format(limit=measures.max_connections)
+    commands += [
+        f"-A {chain} {limit} -j DROP"
+        for chain in _measure_chains(prefix, measures.connection_limit, CONNECTION_LIMIT_HOST_CHAINS)
+    ]
+
+    return commands
+
+
+def build_apply_script(
+    current_rules: str, prefix: str, rules: Sequence[TrackerRule], measures: Measures = NO_MEASURES
+) -> str:
+    """Build iptables-restore input that replaces our chains with the given rules and measures.
 
     ``current_rules`` is the output of ``iptables -S``. The same script works
     for ip6tables when the rules are IPv6 ones.
@@ -105,6 +156,7 @@ def build_apply_script(current_rules: str, prefix: str, rules: Sequence[TrackerR
     for builtin, chain in zip(BUILTIN_CHAINS, chains, strict=True):
         lines += [_drop_command(builtin, chain, rule) for rule in rules]
 
+    lines += _measure_commands(prefix, measures)
     # Jumps go first so that earlier ACCEPT rules cannot bypass the block list.
     lines += [f"-I {builtin} 1 -j {chain}" for builtin, chain in zip(BUILTIN_CHAINS, chains, strict=True)]
     lines.append("COMMIT")
@@ -128,6 +180,11 @@ def build_remove_script(current_rules: str, prefix: str) -> str | None:
     return "\n".join(["*filter", *commands, "COMMIT"]) + "\n"
 
 
+def _dropped_packets(rules: Iterable[Sequence[str]]) -> int:
+    # Counters are printed as "-c PACKETS BYTES".
+    return sum(int(tokens[tokens.index("-c") + 1]) for tokens in rules)
+
+
 def parse_status(verbose_rules: str, prefix: str, ip_version: int) -> list[ChainStatus]:
     """Describe our installed chains from the output of ``iptables -v -S``."""
     lines = [shlex.split(line) for line in verbose_rules.splitlines()]
@@ -138,14 +195,19 @@ def parse_status(verbose_rules: str, prefix: str, ip_version: int) -> list[Chain
             continue
 
         drops = [tokens for tokens in lines if tokens[:2] == ["-A", chain] and tokens[-1] == "DROP"]
+        # The measures are told apart by the iptables module that their rules use.
+        signatures = [tokens for tokens in drops if "string" in tokens]
+        limits = [tokens for tokens in drops if "connlimit" in tokens]
+        trackers = [tokens for tokens in drops if tokens not in signatures and tokens not in limits]
         statuses.append(
             ChainStatus(
                 ip_version=ip_version,
                 name=chain,
-                rules=len(drops),
-                # Counters are printed as "-c PACKETS BYTES".
-                dropped_packets=sum(int(tokens[tokens.index("-c") + 1]) for tokens in drops),
+                rules=len(trackers),
+                dropped_packets=_dropped_packets(trackers),
                 is_active=any(tokens[:2] == ["-A", builtin] and tokens[-2:] == ["-j", chain] for tokens in lines),
+                signature_drops=_dropped_packets(signatures) if signatures else None,
+                connection_limit_drops=_dropped_packets(limits) if limits else None,
             )
         )
 
@@ -185,8 +247,8 @@ def _restore(family: Family, script: str) -> None:
     _run([family.restore_command, "-w", "--noflush"], stdin=script)
 
 
-def apply_rules(prefix: str, rules: Sequence[TrackerRule]) -> None:
-    """Replace any previously applied rules with the given ones.
+def apply_rules(prefix: str, rules: Sequence[TrackerRule], measures: Measures = NO_MEASURES) -> None:
+    """Replace any previously applied rules and measures with the given ones.
 
     IPv4 and IPv6 are separate transactions, applied in that order.
     """
@@ -199,7 +261,10 @@ def apply_rules(prefix: str, rules: Sequence[TrackerRule]) -> None:
     # Read and build everything first, so that a failure there changes nothing.
     scripts = [
         build_apply_script(
-            _current_rules(family), prefix, [rule for rule in rules if rule.ip_version == family.ip_version]
+            _current_rules(family),
+            prefix,
+            [rule for rule in rules if rule.ip_version == family.ip_version],
+            measures,
         )
         for family in families
     ]

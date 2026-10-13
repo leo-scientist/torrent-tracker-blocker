@@ -1,5 +1,6 @@
 import shutil
 import subprocess
+from itertools import product
 from pathlib import Path
 from typing import NoReturn
 
@@ -13,6 +14,7 @@ from torrent_tracker_blocker.firewall import (
     build_remove_script,
     parse_status,
 )
+from torrent_tracker_blocker.measures import Measures, Scope
 from torrent_tracker_blocker.rules import TrackerRule
 
 RULES = [TrackerRule("tcp", 6969, "46.4.109.148"), TrackerRule("udp", 80, "185.217.0.76")]
@@ -293,3 +295,216 @@ def test_chain_statuses_cover_both_ip_versions(monkeypatch: pytest.MonkeyPatch, 
         (4, "vpn-output"),
         (4, "vpn-forward"),
     ]
+
+
+SCOPE_COMBINATIONS = list(product(Scope, Scope))
+# The chains that each measure must add its rules to, per scope.
+SIGNATURE_CHAINS = {
+    Scope.OFF: [],
+    Scope.FORWARD: ["vpn-forward"],
+    Scope.ALL: ["vpn-input", "vpn-output", "vpn-forward"],
+}
+CONNECTION_LIMIT_CHAINS = {
+    Scope.OFF: [],
+    Scope.FORWARD: ["vpn-forward"],
+    Scope.ALL: ["vpn-output", "vpn-forward"],
+}
+SIGNATURES = [
+    '-m string --hex-string "|13|BitTorrent protocol" --algo kmp --to 128',
+    '-p udp -m string --string "d1:ad2:id20:" --algo kmp --to 64',
+    '-p udp -m string --hex-string "|000004172710198000000000|" --algo kmp --to 64',
+    '-p tcp -m string --string "info_hash=" --algo kmp --to 512',
+]
+
+
+def signature_commands(scope: Scope) -> list[str]:
+    return [f"-A {chain} {signature} -j DROP" for chain in SIGNATURE_CHAINS[scope] for signature in SIGNATURES]
+
+
+def connection_limit_commands(scope: Scope, max_connections: int) -> list[str]:
+    return [
+        f"-A {chain} -m conntrack --ctstate NEW -m connlimit --connlimit-above {max_connections} --connlimit-saddr"
+        " -j DROP"
+        for chain in CONNECTION_LIMIT_CHAINS[scope]
+    ]
+
+
+def test_apply_script_with_every_measure() -> None:
+    measures = Measures(signatures=Scope.ALL, connection_limit=Scope.ALL, max_connections=150)
+
+    assert (
+        build_apply_script(CLEAN, "vpn", RULES[:1], measures)
+        == """\
+*filter
+:vpn-input - [0:0]
+:vpn-output - [0:0]
+:vpn-forward - [0:0]
+-A vpn-input -m addrtype --src-type LOCAL -j RETURN
+-A vpn-output -m addrtype --dst-type LOCAL -j RETURN
+-A vpn-input -s 46.4.109.148/32 -p tcp -m tcp --sport 6969 -j DROP
+-A vpn-output -d 46.4.109.148/32 -p tcp -m tcp --dport 6969 -j DROP
+-A vpn-forward -d 46.4.109.148/32 -p tcp -m tcp --dport 6969 -j DROP
+-A vpn-input -m string --hex-string "|13|BitTorrent protocol" --algo kmp --to 128 -j DROP
+-A vpn-input -p udp -m string --string "d1:ad2:id20:" --algo kmp --to 64 -j DROP
+-A vpn-input -p udp -m string --hex-string "|000004172710198000000000|" --algo kmp --to 64 -j DROP
+-A vpn-input -p tcp -m string --string "info_hash=" --algo kmp --to 512 -j DROP
+-A vpn-output -m string --hex-string "|13|BitTorrent protocol" --algo kmp --to 128 -j DROP
+-A vpn-output -p udp -m string --string "d1:ad2:id20:" --algo kmp --to 64 -j DROP
+-A vpn-output -p udp -m string --hex-string "|000004172710198000000000|" --algo kmp --to 64 -j DROP
+-A vpn-output -p tcp -m string --string "info_hash=" --algo kmp --to 512 -j DROP
+-A vpn-forward -m string --hex-string "|13|BitTorrent protocol" --algo kmp --to 128 -j DROP
+-A vpn-forward -p udp -m string --string "d1:ad2:id20:" --algo kmp --to 64 -j DROP
+-A vpn-forward -p udp -m string --hex-string "|000004172710198000000000|" --algo kmp --to 64 -j DROP
+-A vpn-forward -p tcp -m string --string "info_hash=" --algo kmp --to 512 -j DROP
+-A vpn-output -m conntrack --ctstate NEW -m connlimit --connlimit-above 150 --connlimit-saddr -j DROP
+-A vpn-forward -m conntrack --ctstate NEW -m connlimit --connlimit-above 150 --connlimit-saddr -j DROP
+-I INPUT 1 -j vpn-input
+-I OUTPUT 1 -j vpn-output
+-I FORWARD 1 -j vpn-forward
+COMMIT
+"""
+    )
+
+
+def test_apply_script_without_measures_is_the_default() -> None:
+    assert build_apply_script(CLEAN, "vpn", RULES, Measures()) == build_apply_script(CLEAN, "vpn", RULES)
+
+
+@pytest.mark.parametrize(("signatures", "connection_limit"), SCOPE_COMBINATIONS)
+@pytest.mark.parametrize("rules", [RULES, IPV6_RULES, []], ids=["ipv4", "ipv6", "no-rules"])
+@pytest.mark.parametrize("current_rules", [CLEAN, INSTALLED], ids=["clean", "installed"])
+def test_apply_script_puts_each_measure_into_the_chains_of_its_scope(
+    signatures: Scope, connection_limit: Scope, rules: list[TrackerRule], current_rules: str
+) -> None:
+    measures = Measures(signatures, connection_limit, max_connections=37)
+
+    lines = build_apply_script(current_rules, "vpn", rules, measures).splitlines()
+
+    expected = [*signature_commands(signatures), *connection_limit_commands(connection_limit, 37)]
+    assert [line for line in lines if "-m string" in line or "-m connlimit" in line] == expected
+    # Everything else is exactly what is installed without any measure.
+    assert [line for line in lines if line not in expected] == build_apply_script(
+        current_rules, "vpn", rules
+    ).splitlines()
+
+
+@pytest.mark.parametrize(("signatures", "connection_limit"), SCOPE_COMBINATIONS)
+def test_apply_script_orders_measures_after_the_guards_and_the_tracker_rules(
+    signatures: Scope, connection_limit: Scope
+) -> None:
+    lines = build_apply_script(CLEAN, "vpn", RULES, Measures(signatures, connection_limit, 37)).splitlines()
+    measure_lines = [index for index, line in enumerate(lines) if "-m string" in line or "-m connlimit" in line]
+    tracker_lines = [index for index, line in enumerate(lines) if "port" in line]
+    guards = [index for index, line in enumerate(lines) if line.endswith("-j RETURN")]
+    jumps = [index for index, line in enumerate(lines) if line.startswith("-I")]
+
+    assert len(guards) == 2 and len(jumps) == 3
+    assert all(max(guards) < index < min(jumps) for index in measure_lines)
+    assert all(max(tracker_lines) < index for index in measure_lines)
+
+
+@pytest.mark.parametrize("signatures", Scope)
+def test_apply_script_has_no_trace_of_a_connection_limit_that_is_off(signatures: Scope) -> None:
+    script = build_apply_script(CLEAN, "vpn", RULES, Measures(signatures))
+
+    assert "connlimit" not in script
+    assert "None" not in script
+
+
+@pytest.mark.parametrize("max_connections", [1, 200, 4294967295])
+def test_apply_script_uses_the_configured_connection_limit(max_connections: int) -> None:
+    script = build_apply_script(
+        CLEAN, "vpn", RULES, Measures(connection_limit=Scope.FORWARD, max_connections=max_connections)
+    )
+
+    assert connection_limit_commands(Scope.FORWARD, max_connections) == [
+        line for line in script.splitlines() if "connlimit" in line
+    ]
+
+
+def as_listing(script: str, packets: int) -> str:
+    """What ``iptables -v -S`` prints once the script is applied and every rule has matched some packets."""
+    listing = []
+    for line in script.splitlines():
+        if line.startswith(":"):
+            listing.append(f"-N {line[1:].split()[0]}")
+        elif line.startswith("-A"):
+            match, _, target = line.rpartition(" -j ")
+            listing.append(f"{match} -c {packets} {packets * 60} -j {target}")
+        elif line.startswith("-I"):
+            _, builtin, _, _, chain = line.split()
+            listing.append(f"-A {builtin} -c 0 0 -j {chain}")
+    return "\n".join(listing) + "\n"
+
+
+@pytest.mark.parametrize(("signatures", "connection_limit"), SCOPE_COMBINATIONS)
+@pytest.mark.parametrize("rules", [RULES, IPV6_RULES, []], ids=["ipv4", "ipv6", "no-rules"])
+def test_parse_status_tells_the_measures_apart_in_every_combination(
+    signatures: Scope, connection_limit: Scope, rules: list[TrackerRule]
+) -> None:
+    script = build_apply_script(CLEAN, "vpn", rules, Measures(signatures, connection_limit, max_connections=37))
+
+    assert parse_status(as_listing(script, packets=5), "vpn", 4) == [
+        ChainStatus(
+            4,
+            chain,
+            rules=len(rules),
+            dropped_packets=5 * len(rules),
+            is_active=True,
+            signature_drops=5 * len(SIGNATURES) if chain in SIGNATURE_CHAINS[signatures] else None,
+            connection_limit_drops=5 if chain in CONNECTION_LIMIT_CHAINS[connection_limit] else None,
+        )
+        for chain in ["vpn-input", "vpn-output", "vpn-forward"]
+    ]
+
+
+# As printed by a real iptables: the hex string is normalised and the default mask is spelled out.
+VERBOSE_WITH_MEASURES = """\
+-P FORWARD ACCEPT -c 0 0
+-N vpn-forward
+-N vpn-output
+-A FORWARD -c 900 54000 -j vpn-forward
+-A OUTPUT -c 30 1800 -j vpn-output
+-A vpn-forward -d 46.4.109.148/32 -p tcp -m tcp --dport 6969 -c 4 240 -j DROP
+-A vpn-forward -m string --hex-string "|13426974546f7272656e742070726f746f636f6c|" --algo kmp --to 128 -c 7 868 -j DROP
+-A vpn-forward -p udp -m string --string "d1:ad2:id20:" --algo kmp --to 64 -c 20 1680 -j DROP
+-A vpn-forward -p udp -m string --hex-string "|000004172710198000000000|" --algo kmp --to 64 -c 3 132 -j DROP
+-A vpn-forward -p tcp -m string --string "info_hash=" --algo kmp --to 512 -c 0 0 -j DROP
+-A vpn-forward -m conntrack --ctstate NEW -m connlimit --connlimit-above 200 --connlimit-mask 32 --connlimit-saddr -c 11 660 -j DROP
+-A vpn-output -m addrtype --dst-type LOCAL -c 2 120 -j RETURN
+-A vpn-output -d 46.4.109.148/32 -p tcp -m tcp --dport 6969 -c 1 60 -j DROP
+"""  # noqa: E501
+
+
+def test_parse_status_counts_what_each_measure_dropped() -> None:
+    assert parse_status(VERBOSE_WITH_MEASURES, "vpn", 4) == [
+        ChainStatus(4, "vpn-output", rules=1, dropped_packets=1, is_active=True),
+        ChainStatus(
+            4,
+            "vpn-forward",
+            rules=1,
+            dropped_packets=4,
+            is_active=True,
+            signature_drops=30,
+            connection_limit_drops=11,
+        ),
+    ]
+
+
+@pytest.mark.parametrize(("signatures", "connection_limit"), SCOPE_COMBINATIONS)
+def test_apply_rules_installs_the_measures_for_both_ip_versions(
+    commands: Commands, ipv6_stack: Path, signatures: Scope, connection_limit: Scope
+) -> None:
+    firewall.apply_rules("vpn", [*RULES, *IPV6_RULES], Measures(signatures, connection_limit, max_connections=37))
+
+    expected = [*signature_commands(signatures), *connection_limit_commands(connection_limit, 37)]
+    for command, script in commands[2:]:
+        assert command[0] in ("iptables-restore", "ip6tables-restore")
+        assert script is not None
+        assert [line for line in script.splitlines() if "-m string" in line or "-m connlimit" in line] == expected
+
+
+def test_apply_rules_installs_no_measure_by_default(commands: Commands, ipv6_stack: Path) -> None:
+    firewall.apply_rules("vpn", RULES)
+
+    assert not any("string" in (script or "") or "connlimit" in (script or "") for _, script in commands)

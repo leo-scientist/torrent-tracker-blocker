@@ -6,12 +6,15 @@ explicitly enabled: see scripts/integration-test.sh.
 
 import os
 import socket
+import struct
 import subprocess
 from collections.abc import Iterator
+from itertools import product
 
 import pytest
 
 from torrent_tracker_blocker.firewall import ChainStatus, apply_rules, chain_statuses, remove_rules
+from torrent_tracker_blocker.measures import NO_MEASURES, Measures, Scope
 from torrent_tracker_blocker.rules import TrackerRule
 
 pytestmark = pytest.mark.skipif(
@@ -191,3 +194,242 @@ def test_remove_restores_the_original_firewall() -> None:
     assert remove_rules(PREFIX) is True
     assert (iptables("-S"), ip6tables("-S")) == before
     assert remove_rules(PREFIX) is False
+
+
+SCOPE_COMBINATIONS = list(product(Scope, Scope))
+IP_VERSIONS = [4, 6]
+# Documentation ranges: routable, but nobody answers there.
+REMOTE = {4: "192.0.2.1", 6: "2001:db8::1"}
+LOOPBACK = {4: "127.0.0.1", 6: "::1"}
+INTERFACE = "tb-test0"
+SOCKET_FAMILY = {4: socket.AF_INET, 6: socket.AF_INET6}
+HOST_PREFIX_LENGTH = {4: 32, 6: 128}
+# The measure rules as iptables prints them back.
+SIGNATURES = [
+    '-m string --hex-string "|13426974546f7272656e742070726f746f636f6c|" --algo kmp --to 128',
+    '-p udp -m string --string "d1:ad2:id20:" --algo kmp --to 64',
+    '-p udp -m string --hex-string "|000004172710198000000000|" --algo kmp --to 64',
+    '-p tcp -m string --string "info_hash=" --algo kmp --to 512',
+]
+SIGNATURE_CHAINS = {Scope.OFF: [], Scope.FORWARD: ["forward"], Scope.ALL: ["input", "output", "forward"]}
+CONNECTION_LIMIT_CHAINS = {Scope.OFF: [], Scope.FORWARD: ["forward"], Scope.ALL: ["output", "forward"]}
+
+HANDSHAKE = b"\x13BitTorrent protocol" + bytes(48)
+UTP_HEADER = bytes(20)
+DHT_QUERY = b"d1:ad2:id20:abcdefghij0123456789e1:q4:ping1:t2:aa1:y1:qe"
+TRACKER_CONNECT = bytes.fromhex("0000041727101980" + "00000000" + "12345678")
+ANNOUNCE = b"GET /announce?info_hash=%124Vx%9A&peer_id=-TR4000-000000000000&port=51413 HTTP/1.1\r\n\r\n"
+
+
+def listing(ip_version: int, *args: str) -> list[str]:
+    return iptables(*args) if ip_version == 4 else ip6tables(*args)
+
+
+def is_dropped(client: socket.socket, packet: bytes, address: tuple[str, int]) -> bool:
+    # The kernel reports a packet dropped in OUTPUT as EPERM.
+    try:
+        client.sendto(packet, address)
+    except PermissionError:
+        return True
+    return False
+
+
+def udp_is_dropped(ip_version: int, payload: bytes, port: int = 6881, host: str | None = None) -> bool:
+    with socket.socket(SOCKET_FAMILY[ip_version], socket.SOCK_DGRAM) as client:
+        return is_dropped(client, payload, (host or REMOTE[ip_version], port))
+
+
+def tcp_is_dropped(ip_version: int, payload: bytes) -> bool:
+    """Send a hand-made TCP segment: a real connection needs somebody to answer the handshake."""
+    header = struct.pack("!HHIIBBHHH", 40000, 6881, 1, 1, 5 << 4, 0x18, 65535, 0, 0)
+    with socket.socket(SOCKET_FAMILY[ip_version], socket.SOCK_RAW, socket.IPPROTO_TCP) as client:
+        return is_dropped(client, header + payload, (REMOTE[ip_version], 0))
+
+
+@pytest.fixture
+def ipv6_route() -> Iterator[None]:
+    """Give the IPv6 documentation range a route, so that packets to it reach the firewall at all.
+
+    Through an interface of its own: packets routed to the loopback come back in, which
+    confuses the connection tracking that the connection limit counts with.
+    """
+    run("ip", "link", "add", INTERFACE, "type", "dummy")
+    try:
+        run("ip", "link", "set", INTERFACE, "up")
+        run("ip", "-6", "addr", "add", "2001:db8:ffff::1/64", "dev", INTERFACE, "nodad")
+        run("ip", "-6", "route", "add", "2001:db8::/32", "dev", INTERFACE)
+        yield
+    finally:
+        run("ip", "link", "del", INTERFACE)
+
+
+def expected_chain(ip_version: int, builtin: str, rules: list[TrackerRule], measures: Measures) -> list[str]:
+    chain = f"{PREFIX}-{builtin}"
+    lines = []
+    if builtin == "input":
+        lines.append(f"-A {chain} -m addrtype --src-type LOCAL -j RETURN")
+    if builtin == "output":
+        lines.append(f"-A {chain} -m addrtype --dst-type LOCAL -j RETURN")
+
+    address, port = ("-s", "--sport") if builtin == "input" else ("-d", "--dport")
+    lines += [
+        f"-A {chain} {address} {rule.ip}/{HOST_PREFIX_LENGTH[ip_version]}"
+        f" -p {rule.protocol} -m {rule.protocol} {port} {rule.port} -j DROP"
+        for rule in rules
+        if rule.ip_version == ip_version
+    ]
+
+    if builtin in SIGNATURE_CHAINS[measures.signatures]:
+        lines += [f"-A {chain} {signature} -j DROP" for signature in SIGNATURES]
+    if builtin in CONNECTION_LIMIT_CHAINS[measures.connection_limit]:
+        lines.append(
+            f"-A {chain} -m conntrack --ctstate NEW -m connlimit --connlimit-above {measures.max_connections}"
+            f" --connlimit-mask {HOST_PREFIX_LENGTH[ip_version]} --connlimit-saddr -j DROP"
+        )
+
+    return lines
+
+
+@pytest.mark.parametrize(("signatures", "connection_limit"), SCOPE_COMBINATIONS)
+def test_every_combination_of_measures_installs_exactly_its_rules(signatures: Scope, connection_limit: Scope) -> None:
+    before = iptables("-S"), ip6tables("-S")
+    rules = [*RULES, IPV6_RULE]
+    measures = Measures(signatures, connection_limit, max_connections=37)
+
+    # Whatever was configured before must leave no trace.
+    apply_rules(PREFIX, rules, Measures(Scope.ALL, Scope.ALL, max_connections=7))
+    apply_rules(PREFIX, rules, measures)
+
+    for ip_version in IP_VERSIONS:
+        for builtin in ("input", "output", "forward"):
+            assert listing(ip_version, "-S", f"{PREFIX}-{builtin}")[1:] == expected_chain(
+                ip_version, builtin, rules, measures
+            )
+
+    assert chain_statuses(PREFIX) == [
+        ChainStatus(
+            ip_version,
+            f"{PREFIX}-{builtin}",
+            rules=sum(rule.ip_version == ip_version for rule in rules),
+            dropped_packets=0,
+            is_active=True,
+            signature_drops=0 if builtin in SIGNATURE_CHAINS[signatures] else None,
+            connection_limit_drops=0 if builtin in CONNECTION_LIMIT_CHAINS[connection_limit] else None,
+        )
+        for ip_version in IP_VERSIONS
+        for builtin in ("input", "output", "forward")
+    ]
+
+    assert remove_rules(PREFIX) is True
+    assert (iptables("-S"), ip6tables("-S")) == before
+
+
+@pytest.mark.parametrize(("signatures", "connection_limit"), SCOPE_COMBINATIONS)
+@pytest.mark.parametrize("ip_version", IP_VERSIONS)
+def test_every_combination_of_measures_treats_the_traffic_of_the_host_as_configured(
+    ipv6_route: None, ip_version: int, signatures: Scope, connection_limit: Scope
+) -> None:
+    measures = Measures(signatures, connection_limit, max_connections=3)
+
+    apply_rules(PREFIX, RULES, measures)
+    assert udp_is_dropped(ip_version, DHT_QUERY) is (signatures is Scope.ALL)
+    assert udp_is_dropped(ip_version, b"not a torrent", port=6999) is False
+
+    # Applying again starts counting the connections afresh.
+    apply_rules(PREFIX, RULES, measures)
+    connections = [udp_is_dropped(ip_version, b"hello", port) for port in range(7000, 7008)]
+
+    is_limited = connection_limit is Scope.ALL
+    assert connections == [False] * 3 + [is_limited] * 5
+
+
+@pytest.mark.parametrize("ip_version", IP_VERSIONS)
+def test_signatures_drop_every_kind_of_bittorrent_packet(ipv6_route: None, ip_version: int) -> None:
+    apply_rules(PREFIX, RULES, Measures(signatures=Scope.ALL))
+
+    assert udp_is_dropped(ip_version, DHT_QUERY)
+    assert udp_is_dropped(ip_version, TRACKER_CONNECT)
+    assert udp_is_dropped(ip_version, UTP_HEADER + HANDSHAKE)
+    assert tcp_is_dropped(ip_version, HANDSHAKE)
+    assert tcp_is_dropped(ip_version, ANNOUNCE)
+
+    output = chain_statuses(PREFIX)[1 if ip_version == 4 else 4]
+    assert (output.ip_version, output.name) == (ip_version, f"{PREFIX}-output")
+    assert output.signature_drops == 5
+    assert output.dropped_packets == 0
+
+
+@pytest.mark.parametrize("ip_version", IP_VERSIONS)
+def test_signatures_let_other_traffic_through(ipv6_route: None, ip_version: int) -> None:
+    apply_rules(PREFIX, RULES, Measures(signatures=Scope.ALL))
+
+    assert not udp_is_dropped(ip_version, b"\x00" * 16)
+    assert not udp_is_dropped(ip_version, b"d1:rd2:id20:abcdefghij0123456789e1:t2:aa1:y1:re")
+    assert not tcp_is_dropped(ip_version, b"GET /index.html HTTP/1.1\r\nHost: example.com\r\n\r\n")
+    assert not tcp_is_dropped(ip_version, bytes(64))
+    # Only the start of a packet is searched: this is not what a DHT query looks like.
+    assert not udp_is_dropped(ip_version, b"x" * 100 + DHT_QUERY)
+    assert chain_statuses(PREFIX)[1 if ip_version == 4 else 4].signature_drops == 0
+
+
+@pytest.mark.parametrize("ip_version", IP_VERSIONS)
+@pytest.mark.parametrize("scope", [Scope.OFF, Scope.FORWARD])
+def test_signatures_outside_their_scope_leave_the_host_alone(ipv6_route: None, ip_version: int, scope: Scope) -> None:
+    apply_rules(PREFIX, RULES, Measures(signatures=scope))
+
+    assert not udp_is_dropped(ip_version, DHT_QUERY)
+    assert not udp_is_dropped(ip_version, TRACKER_CONNECT)
+    assert not udp_is_dropped(ip_version, UTP_HEADER + HANDSHAKE)
+    assert not tcp_is_dropped(ip_version, HANDSHAKE)
+    assert not tcp_is_dropped(ip_version, ANNOUNCE)
+
+
+@pytest.mark.parametrize("ip_version", IP_VERSIONS)
+def test_measures_never_apply_to_the_own_addresses_of_the_host(ip_version: int) -> None:
+    apply_rules(PREFIX, RULES, Measures(Scope.ALL, Scope.ALL, max_connections=1))
+
+    assert not udp_is_dropped(ip_version, DHT_QUERY, host=LOOPBACK[ip_version])
+    assert [udp_is_dropped(ip_version, b"hello", port, LOOPBACK[ip_version]) for port in range(7000, 7005)] == [
+        False
+    ] * 5
+
+
+@pytest.mark.parametrize("ip_version", IP_VERSIONS)
+@pytest.mark.parametrize("max_connections", [1, 2, 5])
+def test_the_connection_limit_is_exact(ipv6_route: None, ip_version: int, max_connections: int) -> None:
+    apply_rules(PREFIX, RULES, Measures(connection_limit=Scope.ALL, max_connections=max_connections))
+
+    connections = [udp_is_dropped(ip_version, b"hello", port) for port in range(7000, 7008)]
+
+    assert connections == [False] * max_connections + [True] * (8 - max_connections)
+    output = chain_statuses(PREFIX)[1 if ip_version == 4 else 4]
+    assert output.connection_limit_drops == 8 - max_connections
+
+
+def test_tracker_rules_keep_working_next_to_the_measures() -> None:
+    tracker = RULES[1]
+    apply_rules(PREFIX, RULES, Measures(Scope.ALL, Scope.ALL, max_connections=100))
+
+    assert udp_is_dropped(4, b"announce", tracker.port, tracker.ip)
+    assert not udp_is_dropped(4, b"announce", tracker.port + 1, tracker.ip)
+
+    output = chain_statuses(PREFIX)[1]
+    assert (output.dropped_packets, output.signature_drops, output.connection_limit_drops) == (1, 0, 0)
+
+
+@pytest.mark.parametrize("max_connections", [1, 4294967295])
+@pytest.mark.parametrize("ip_version", IP_VERSIONS)
+def test_the_smallest_and_the_largest_connection_limit_can_be_installed(ip_version: int, max_connections: int) -> None:
+    apply_rules(PREFIX, RULES, Measures(connection_limit=Scope.ALL, max_connections=max_connections))
+
+    assert any(
+        f"--connlimit-above {max_connections} " in line for line in listing(ip_version, "-S", f"{PREFIX}-forward")
+    )
+
+
+def test_measures_are_removed_by_applying_without_them() -> None:
+    apply_rules(PREFIX, RULES, Measures(Scope.ALL, Scope.ALL, max_connections=5))
+    apply_rules(PREFIX, RULES, NO_MEASURES)
+
+    for ip_version in IP_VERSIONS:
+        assert not any("string" in line or "connlimit" in line for line in listing(ip_version, "-S"))
