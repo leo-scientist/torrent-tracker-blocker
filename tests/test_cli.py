@@ -6,13 +6,14 @@ from typing import NoReturn
 import pytest
 
 from torrent_tracker_blocker import blocklist, cli, sources
-from torrent_tracker_blocker.config import DEFAULT_WHITELIST
 from torrent_tracker_blocker.firewall import IPV4, IPV6, ChainStatus, Family, FirewallError
 from torrent_tracker_blocker.measures import NO_MEASURES, Measures, Scope
 from torrent_tracker_blocker.rules import TrackerRule
 from torrent_tracker_blocker.sources import SourceError
 
 REMOTE_LIST = "https://lists.example.com/trackers.txt"
+# The address ranges that a content delivery network publishes; cdn.example.com is behind it.
+PROVIDER_RANGES = ("https://provider.example.com/ips-v4", "https://provider.example.com/ips-v6")
 
 Documents = dict[str, bytes | Exception]
 Applied = list[tuple[str, list[TrackerRule]]]
@@ -36,8 +37,8 @@ def dns(dns: dict[str, list[str]]) -> dict[str, list[str]]:
 @pytest.fixture(autouse=True)
 def remote(monkeypatch: pytest.MonkeyPatch) -> Documents:
     """Serve downloadable documents by URL; an Exception value makes the download fail."""
-    cloudflare_ipv4, cloudflare_ipv6 = DEFAULT_WHITELIST
-    documents: Documents = {cloudflare_ipv4: b"104.16.0.0/13\n", cloudflare_ipv6: b"2606:4700::/32\n"}
+    provider_ipv4, provider_ipv6 = PROVIDER_RANGES
+    documents: Documents = {provider_ipv4: b"104.16.0.0/13\n", provider_ipv6: b"2606:4700::/32\n"}
 
     def fetch(url: str) -> bytes:
         document = documents[url]
@@ -142,24 +143,27 @@ def test_parse_merge_refuses_a_corrupt_previous_file(workdir: Path) -> None:
     assert (workdir / "trackers.csv").read_text() == "tcp,22,127.0.0.1\n"
 
 
-def test_parse_whitelists_cloudflare_by_default(workdir: Path) -> None:
+def test_parse_whitelists_the_ranges_of_a_provider_on_request(workdir: Path) -> None:
     (workdir / "trackers.txt").write_text(
         "https://cdn.example.com/announce\nhttp://tracker.example.com:6969/announce\n"
     )
 
-    assert cli.main(["parse", "-i", "trackers.txt"]) == 0
+    assert cli.main(["parse", "-i", "trackers.txt", "-w", *PROVIDER_RANGES]) == 0
     assert (workdir / "trackers.csv").read_text() == "tcp,6969,46.4.13.97\n"
 
 
-def test_parse_with_an_empty_whitelist_blocks_cloudflare_too(workdir: Path, remote: Documents) -> None:
-    for url in DEFAULT_WHITELIST:
+@pytest.mark.parametrize("options", [[], ["--whitelist"]], ids=["default", "empty"])
+def test_parse_blocks_the_trackers_behind_a_provider_unless_whitelisted(
+    workdir: Path, remote: Documents, options: list[str]
+) -> None:
+    for url in PROVIDER_RANGES:
         del remote[url]  # must not even be downloaded
     (workdir / "trackers.txt").write_text(
         "https://cdn.example.com/announce\nhttps://cdn6.example.com/announce\n"
         "http://tracker.example.com:6969/announce\n"
     )
 
-    assert cli.main(["parse", "-i", "trackers.txt", "--whitelist"]) == 0
+    assert cli.main(["parse", "-i", "trackers.txt", *options]) == 0
     assert (workdir / "trackers.csv").read_text() == (
         "tcp,443,104.16.1.1\ntcp,443,2606:4700::6810:101\ntcp,6969,46.4.13.97\n"
     )
@@ -174,7 +178,7 @@ def test_parse_writes_ipv6_rules(workdir: Path) -> None:
     )
     (workdir / "own.txt").write_text("2a01:4f8:c17:8f74::4/127  # ours\n")
 
-    assert cli.main(["parse", "-i", "trackers.txt", "-w", "own.txt", *DEFAULT_WHITELIST]) == 0
+    assert cli.main(["parse", "-i", "trackers.txt", "-w", "own.txt", *PROVIDER_RANGES]) == 0
     assert (workdir / "trackers.csv").read_text() == (
         "udp,6969,5.79.209.57\nudp,6969,2a01:4f8:c17:8f74::2\nudp,1337,2a01:4f8:c17:8f74::3\n"
     )
@@ -187,7 +191,7 @@ def test_parse_whitelist_covers_previous_rules(workdir: Path) -> None:
     (workdir / "own.txt").write_text("5.79.209.57  # monitoring\n")
     (workdir / "trackers.csv").write_text("udp,1337,5.79.209.57\ntcp,443,104.17.2.2\n")
 
-    assert cli.main(["parse", "-i", "trackers.txt", "-w", "own.txt", *DEFAULT_WHITELIST, "--merge"]) == 0
+    assert cli.main(["parse", "-i", "trackers.txt", "-w", "own.txt", *PROVIDER_RANGES, "--merge"]) == 0
     assert (workdir / "trackers.csv").read_text() == "tcp,6969,46.4.13.97\n"
 
 
@@ -212,7 +216,7 @@ def test_parse_keeps_existing_output_when_everything_is_whitelisted(workdir: Pat
     assert (workdir / "trackers.csv").read_text() == "tcp,80,5.79.209.57\n"
 
 
-@pytest.mark.parametrize("failing", [REMOTE_LIST, *DEFAULT_WHITELIST])
+@pytest.mark.parametrize("failing", [REMOTE_LIST, *PROVIDER_RANGES])
 def test_parse_keeps_existing_output_when_a_download_fails(
     workdir: Path, remote: Documents, caplog: pytest.LogCaptureFixture, failing: str
 ) -> None:
@@ -220,7 +224,7 @@ def test_parse_keeps_existing_output_when_a_download_fails(
     remote[failing] = SourceError(f"{failing}: HTTP Error 503: Service Unavailable")
     (workdir / "trackers.csv").write_text("tcp,80,5.79.209.57\n")
 
-    assert cli.main(["parse", "-i", REMOTE_LIST]) == 1
+    assert cli.main(["parse", "-i", REMOTE_LIST, "-w", *PROVIDER_RANGES]) == 1
     assert (workdir / "trackers.csv").read_text() == "tcp,80,5.79.209.57\n"
     assert "HTTP Error 503" in caplog.text
 
@@ -758,7 +762,7 @@ WHITELISTS: dict[str, tuple[list[str], str]] = {
     "address-with-host-bits": (["5.79.209.57/16"], CDN + CDN6 + TRACKER + DUAL6),
     "file": (["own.txt"], CDN + DUAL + DUAL6),
     "url": ([REMOTE_WHITELIST], CDN6 + TRACKER + DUAL + DUAL6),
-    "provider": (list(DEFAULT_WHITELIST), TRACKER + DUAL + DUAL6),
+    "provider": (list(PROVIDER_RANGES), TRACKER + DUAL + DUAL6),
     "everything-together": (["46.4.13.97", "own.txt", REMOTE_WHITELIST, "2a01:4f8::/32"], DUAL),
 }
 
@@ -777,9 +781,15 @@ def toml_whitelist(entries: list[str]) -> str:
 
 
 @pytest.mark.parametrize("command", ["parse", "update"])
-def test_the_default_whitelist_is_cloudflare(whitelisting: Path, applied: Applied, command: str) -> None:
+def test_nothing_is_whitelisted_by_default(
+    whitelisting: Path, remote: Documents, applied: Applied, command: str
+) -> None:
+    # No provider is built in: nothing but the tracker list is downloaded.
+    for url in (*PROVIDER_RANGES, REMOTE_WHITELIST):
+        del remote[url]
+
     assert cli.main([command, "-i", "trackers.txt", "-o", "rules.csv"]) == 0
-    assert (whitelisting / "rules.csv").read_text() == TRACKER + DUAL + DUAL6
+    assert (whitelisting / "rules.csv").read_text() == CDN + CDN6 + TRACKER + DUAL + DUAL6
 
 
 @pytest.mark.parametrize("command", ["parse", "update"])
@@ -821,7 +831,7 @@ def test_the_whitelist_option_replaces_the_configured_whitelist(
 
 
 def test_an_empty_whitelist_downloads_no_provider_list(whitelisting: Path, remote: Documents) -> None:
-    for url in DEFAULT_WHITELIST:
+    for url in PROVIDER_RANGES:
         del remote[url]
     (whitelisting / "config.toml").write_text("whitelist = []\n")
 
@@ -893,7 +903,7 @@ def test_apply_loads_the_rule_file_as_it_is_whatever_the_whitelist(
 ) -> None:
     # Nothing is downloaded at boot: the whitelist was applied when the rule file was written.
     remote.clear()
-    default_config.write_text(toml_whitelist(["46.4.13.97", "missing.txt", *DEFAULT_WHITELIST]))
+    default_config.write_text(toml_whitelist(["46.4.13.97", "missing.txt", *PROVIDER_RANGES]))
     (whitelisting / "rules.csv").write_text(CDN + TRACKER)
 
     assert cli.main(["apply", "-i", "rules.csv"]) == 0

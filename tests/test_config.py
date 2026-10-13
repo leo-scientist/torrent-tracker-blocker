@@ -3,13 +3,13 @@ from pathlib import Path
 
 import pytest
 
-from torrent_tracker_blocker.config import DEFAULT_WHITELIST, DEFAULTS, Config, load_config
+from torrent_tracker_blocker.config import DEFAULTS, Config, load_config
 from torrent_tracker_blocker.measures import MAX_CONNECTIONS_CEILING, NO_MEASURES, ConfigError, Measures, Scope
 
 SCOPE_COMBINATIONS = list(product(Scope, Scope))
 # How the whitelist can be written in the file, and what that means.
 WHITELISTS = {
-    "": DEFAULT_WHITELIST,
+    "": (),
     "whitelist = []\n": (),
     'whitelist = ["10.8.0.5"]\n': ("10.8.0.5",),
     'whitelist = ["https://example.com/ranges.txt", "/etc/own.txt", "2001:db8::/32"]\n': (
@@ -26,10 +26,10 @@ def write_config(tmp_path: Path, content: str | bytes) -> Path:
     return path
 
 
-def test_defaults_whitelist_cloudflare_and_enable_no_measure() -> None:
+def test_defaults_whitelist_nothing_and_enable_no_measure() -> None:
     assert Config() == DEFAULTS
     assert DEFAULTS.measures == NO_MEASURES
-    assert DEFAULTS.whitelist == ("https://www.cloudflare.com/ips-v4", "https://www.cloudflare.com/ips-v6")
+    assert DEFAULTS.whitelist == ()
 
 
 @pytest.mark.parametrize(("signatures", "connection_limit"), SCOPE_COMBINATIONS)

@@ -37,8 +37,10 @@ sudo systemctl enable --now tracker-blocker-update.timer tracker-blocker-restore
 Check that it works with `sudo tracker-blocker status`; undo everything with
 `sudo tracker-blocker remove`.
 
-This blocks the listed trackers and nothing else. To change which addresses
-are spared or to block more than trackers, see [Configuration](#configuration).
+This blocks every listed tracker and nothing else. Some trackers share
+their address with unrelated sites, which then become unreachable as well:
+see [Whitelist](#whitelist) for how to spare them. To block more than
+trackers, see [Additional measures](#additional-measures).
 
 ## Limitations
 
@@ -49,9 +51,12 @@ Read these before relying on the tool:
   [additional measures](#additional-measures) close part of that gap, but
   encrypted BitTorrent traffic stays invisible to them. All of this makes
   torrenting harder, not impossible.
-- **Trackers behind Cloudflare stay reachable by default.** Their addresses
-  are shared with a huge number of unrelated sites, so they are on the default
-  [whitelist](#whitelist). That is about one in seven of the listed trackers.
+- **Shared addresses are blocked too.** About one in seven of the listed
+  trackers sits behind a content delivery network such as Cloudflare, on an
+  address that a huge number of unrelated sites share. Blocking it cuts those
+  sites off on the same port. Nothing is spared by default: put the address
+  ranges of such providers on the [whitelist](#whitelist) if that matters to
+  you.
 - **Third-party lists.** The lists decide what gets blocked. See
   [Safety](#safety) for what they can and cannot do to the host.
 
@@ -191,8 +196,8 @@ Settings that the daily update and the restore at boot must share live in
 default:
 
 ```toml
-# Addresses that never get a blocking rule. Replaces the default, so keep
-# the Cloudflare lists here unless you want those addresses blocked too.
+# Addresses that never get a blocking rule: here the ranges that Cloudflare
+# publishes, a list of your own and a single server.
 whitelist = [
     "https://www.cloudflare.com/ips-v4",
     "https://www.cloudflare.com/ips-v6",
@@ -210,7 +215,7 @@ max_connections = 200
 
 | Setting | Command line | Values | Default |
 |---|---|---|---|
-| `whitelist` | `-w`, `--whitelist` | Addresses, ranges, files and URLs, see [Whitelist](#whitelist). | Cloudflare's address ranges |
+| `whitelist` | `-w`, `--whitelist` | Addresses, ranges, files and URLs, see [Whitelist](#whitelist). | Empty |
 | `scope` in `[signatures]` | `--signatures` | `"off"`, `"forward"` or `"all"`, see [Additional measures](#additional-measures). | `"off"` |
 | `scope` in `[connection_limit]` | `--connection-limit` | `"off"`, `"forward"` or `"all"`. | `"off"` |
 | `max_connections` in `[connection_limit]` | `--max-connections` | A whole number from 1 to 4294967295. | None: it must be set once the limit is on. |
@@ -253,18 +258,20 @@ The lists are read again on every `update`, so a provider that changes its
 ranges is followed automatically. If one of them cannot be read, the update
 fails and the previous rules stay.
 
-The default whitelist is the address ranges that Cloudflare publishes
-(<https://www.cloudflare.com/ips-v4> and <https://www.cloudflare.com/ips-v6>).
-A content delivery network serves a huge number of unrelated sites from the
-same addresses, so a rule for a tracker behind one makes every site on that
-address and port unreachable.
+The whitelist is empty by default: no provider is built in, and what to spare
+is your decision. Two kinds of addresses are worth putting on it:
 
-Nothing ties the tool to Cloudflare, though: `whitelist` in the configuration
-file replaces the default. Add the published ranges of other providers, the
-servers the host depends on (DNS resolvers, monitoring, your own services), or
-set `whitelist = []` to whitelist nothing. `-w`/`--whitelist` does the same
-from the command line and replaces the configured list; without a value it
-whitelists nothing.
+- **The ranges of content delivery networks.** They serve a huge number of
+  unrelated sites from the same addresses, so a rule for a tracker behind one
+  makes every site on that address and port unreachable. Many providers
+  publish their ranges in the format above; Cloudflare, for example, at
+  <https://www.cloudflare.com/ips-v4> and <https://www.cloudflare.com/ips-v6>.
+  A provider that publishes them in another format needs a file of your own.
+- **The servers the host depends on**, such as DNS resolvers, monitoring and
+  your own services, so that no list can ever block them.
+
+`-w`/`--whitelist` sets the whitelist from the command line. It replaces the
+configured one, and without a value it whitelists nothing.
 
 The whitelist is applied when the rule file is written, so `apply` loads a
 rule file as it is. It only decides which addresses get a tracker rule: the

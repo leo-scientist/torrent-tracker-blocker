@@ -7,10 +7,6 @@ from typing import Any, cast
 
 from torrent_tracker_blocker.measures import NO_MEASURES, ConfigError, Measures, Scope
 
-# Content delivery networks serve a huge number of unrelated sites from the same addresses, so a
-# rule for a tracker behind one would cut all of them off. This is only the default: a whitelist
-# in the configuration replaces it.
-DEFAULT_WHITELIST = ("https://www.cloudflare.com/ips-v4", "https://www.cloudflare.com/ips-v6")
 # Sections and the options each of them accepts.
 SECTIONS = {
     "signatures": ("scope",),
@@ -23,7 +19,7 @@ class Config:
     """Everything the configuration file can set; what it leaves out stays at its default."""
 
     # Addresses, ranges and lists of them (local files or https:// URLs) that never get a blocking rule.
-    whitelist: tuple[str, ...] = DEFAULT_WHITELIST
+    whitelist: tuple[str, ...] = ()
     measures: Measures = NO_MEASURES
 
 
@@ -31,7 +27,7 @@ DEFAULTS = Config()
 
 
 def _whitelist(document: dict[str, Any]) -> tuple[str, ...]:
-    entries: object = document.get("whitelist", list(DEFAULT_WHITELIST))
+    entries: object = document.get("whitelist", [])
 
     if isinstance(entries, list):
         items = cast("list[object]", entries)

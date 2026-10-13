@@ -142,8 +142,8 @@ def _add_refresh_arguments(parser: argparse.ArgumentParser, default_output: Path
         nargs="*",
         metavar="ADDRESSES",
         help="what never to block: an IP address, a CIDR range, or a file or https:// URL listing them; "
-        "repeatable, and without a value nothing is whitelisted. Replaces the whitelist of the "
-        "configuration file (default: the address ranges of Cloudflare, which unrelated sites share)",
+        "repeatable. Replaces the whitelist of the configuration file; without a value nothing is "
+        "whitelisted, which is also the default",
     )
 
     parser.add_argument(
