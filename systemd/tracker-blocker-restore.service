@@ -1,0 +1,19 @@
+[Unit]
+Description=Restore the BitTorrent tracker block list after boot
+Documentation=https://github.com/leo-scientist/torrent-tracker-blocker
+# Other firewall managers may flush the rule set when they start.
+After=nftables.service netfilter-persistent.service iptables.service firewalld.service ufw.service
+ConditionPathExists=/var/lib/torrent-tracker-blocker/trackers.csv
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/tracker-blocker apply --quiet -i /var/lib/torrent-tracker-blocker/trackers.csv
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+# The legacy iptables backend takes a lock in /run.
+ReadWritePaths=/run
+
+[Install]
+WantedBy=multi-user.target

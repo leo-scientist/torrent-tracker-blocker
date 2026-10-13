@@ -1,0 +1,16 @@
+[Unit]
+Description=Update the BitTorrent tracker block list
+Documentation=https://github.com/leo-scientist/torrent-tracker-blocker
+Wants=network-online.target
+After=network-online.target tracker-blocker-restore.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/tracker-blocker update --quiet
+StateDirectory=torrent-tracker-blocker
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+# The legacy iptables backend takes a lock in /run.
+ReadWritePaths=/run

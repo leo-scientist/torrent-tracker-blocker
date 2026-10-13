@@ -1,0 +1,11 @@
+[Unit]
+Description=Update the BitTorrent tracker block list daily
+Documentation=https://github.com/leo-scientist/torrent-tracker-blocker
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

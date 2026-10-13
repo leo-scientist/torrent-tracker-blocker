@@ -1,1 +1,0 @@
-python-iptables==0.12.0
