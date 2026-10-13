@@ -1,1 +1,1 @@
-"""Block BitTorrent trackers with iptables."""
+"""Block BitTorrent trackers and, optionally, other BitTorrent traffic with iptables."""

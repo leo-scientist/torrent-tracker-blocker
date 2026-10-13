@@ -163,7 +163,10 @@ def _add_refresh_arguments(parser: argparse.ArgumentParser, default_output: Path
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="tracker-blocker", description="Block BitTorrent trackers with iptables")
+    parser = argparse.ArgumentParser(
+        prog="tracker-blocker",
+        description="Block BitTorrent trackers and, optionally, other BitTorrent traffic with iptables",
+    )
     commands = parser.add_subparsers(dest="command", required=True)
 
     common = argparse.ArgumentParser(add_help=False)

@@ -1,7 +1,7 @@
 [project]
 name = "torrent-tracker-blocker"
 version = "0.1.0"
-description = "Block BitTorrent trackers with iptables"
+description = "Block BitTorrent trackers and, optionally, other BitTorrent traffic with iptables"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]

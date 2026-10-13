@@ -37,6 +37,9 @@ sudo systemctl enable --now tracker-blocker-update.timer tracker-blocker-restore
 Check that it works with `sudo tracker-blocker status`; undo everything with
 `sudo tracker-blocker remove`.
 
+This blocks the listed trackers and nothing else. To change which addresses
+are spared or to block more than trackers, see [Configuration](#configuration).
+
 ## Limitations
 
 Read these before relying on the tool:
@@ -183,8 +186,9 @@ the command reports the error and IPv6 keeps its previous rules.
 ## Configuration
 
 Settings that the daily update and the restore at boot must share live in
-`/etc/torrent-tracker-blocker/config.toml`. The file is optional, and whatever
-it leaves out keeps its default:
+`/etc/torrent-tracker-blocker/config.toml`, which `update`, `parse` and
+`apply` read. The file is optional, and whatever it leaves out keeps its
+default:
 
 ```toml
 # Addresses that never get a blocking rule. Replaces the default, so keep
@@ -204,9 +208,34 @@ scope = "forward"
 max_connections = 200
 ```
 
-`--config FILE` reads another file instead. A command line option overrides
-the setting of the same name. An unknown option or a value that cannot be used
-fails the command before anything is downloaded or changed.
+| Setting | Command line | Values | Default |
+|---|---|---|---|
+| `whitelist` | `-w`, `--whitelist` | Addresses, ranges, files and URLs, see [Whitelist](#whitelist). | Cloudflare's address ranges |
+| `scope` in `[signatures]` | `--signatures` | `"off"`, `"forward"` or `"all"`, see [Additional measures](#additional-measures). | `"off"` |
+| `scope` in `[connection_limit]` | `--connection-limit` | `"off"`, `"forward"` or `"all"`. | `"off"` |
+| `max_connections` in `[connection_limit]` | `--max-connections` | A whole number from 1 to 4294967295. | None: it must be set once the limit is on. |
+
+To create the file and put it into effect:
+
+```sh
+sudo mkdir -p /etc/torrent-tracker-blocker
+sudoedit /etc/torrent-tracker-blocker/config.toml
+sudo tracker-blocker update
+```
+
+How the file is read:
+
+- `--config FILE` reads another file instead of the default one.
+- A command line option overrides the setting of the same name.
+- `whitelist` has to stand above the first `[section]`. That is how TOML
+  works: below a section header it would belong to that section, and is
+  rejected there.
+- The file has to be valid on its own. A connection limit that is enabled in
+  it needs its `max_connections` there too, even if you pass the number on
+  the command line.
+- An unknown option or a value that cannot be used fails the command before
+  anything is downloaded or changed. The restore at boot reads the same file,
+  so run `update` after every edit to see that it is accepted.
 
 ### Whitelist
 
@@ -216,7 +245,13 @@ lists say. An entry is one of:
 - an IPv4 or IPv6 address, such as `203.0.113.7`;
 - a CIDR range, such as `198.51.100.0/24` or `2001:db8::/32`;
 - a list of them: a local file or an `https://` URL with one address or range
-  per line, where `#` starts a comment.
+  per line, where `#` starts a comment. Give files by their full path: a
+  relative one is looked up in the directory the command runs in, which under
+  systemd is `/`.
+
+The lists are read again on every `update`, so a provider that changes its
+ranges is followed automatically. If one of them cannot be read, the update
+fails and the previous rules stay.
 
 The default whitelist is the address ranges that Cloudflare publishes
 (<https://www.cloudflare.com/ips-v4> and <https://www.cloudflare.com/ips-v6>).
@@ -329,6 +364,15 @@ entry such as `udp://8.8.8.8:53` would block that DNS resolver for the host
 and for forwarded clients. Put the addresses the host depends on (DNS
 resolvers, monitoring, your own services) on the [whitelist](#whitelist), and
 only add sources you trust.
+
+**Whitelists.** A whitelist can only take addresses off the block list, never
+add to it. The worst a downloaded one can do is to name so much that fewer
+trackers are blocked; if it names everything, `update` fails and keeps the
+previous rules. Like the tracker lists, remote whitelists are only read over
+HTTPS.
+
+**The configuration file** is yours and is trusted as it is. Keep it writable
+by root only: whoever can edit it can switch the blocking off.
 
 **Blocking private addresses on purpose.** A tracker inside your own network,
 such as an ISP's `retracker.local`, has a private address. To block it, list
