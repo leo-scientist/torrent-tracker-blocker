@@ -10,6 +10,7 @@ from torrent_tracker_blocker.firewall import (
     BUILTIN_CHAINS,
     FirewallError,
     chain_statuses,
+    managed_families,
     remove_rules,
 )
 from torrent_tracker_blocker.rules import InvalidRuleError
@@ -75,9 +76,13 @@ def _status(args: argparse.Namespace) -> int:
 
     for status in statuses:
         note = "" if status.is_active else " (inactive: nothing jumps to this chain)"
-        print(f"{status.name}: {status.rules} rules, {status.dropped_packets} packets dropped{note}")
+        print(
+            f"IPv{status.ip_version} {status.name}: {status.rules} rules, "
+            f"{status.dropped_packets} packets dropped{note}"
+        )
 
-    is_complete = len(statuses) == len(BUILTIN_CHAINS) and all(s.is_active for s in statuses)
+    expected_chains = len(BUILTIN_CHAINS) * len(managed_families())
+    is_complete = len(statuses) == expected_chains and all(s.is_active for s in statuses)
 
     return 0 if is_complete else 1
 
@@ -98,7 +103,7 @@ def _add_refresh_arguments(parser: argparse.ArgumentParser, default_output: Path
         action="append",
         default=[],
         metavar="SOURCE",
-        help="file or https:// URL with IPv4 addresses/CIDR ranges to never block; repeatable",
+        help="file or https:// URL with IP addresses/CIDR ranges to never block; repeatable",
     )
 
     parser.add_argument(
@@ -143,7 +148,7 @@ def _build_parser() -> argparse.ArgumentParser:
     private.add_argument(
         "--allow-private",
         action="store_true",
-        help="accept private addresses (10/8, 172.16/12, 192.168/16, 100.64/10) "
+        help="accept private addresses (10/8, 172.16/12, 192.168/16, 100.64/10, fc00::/7) "
         "from local files; never from downloaded lists",
     )
 

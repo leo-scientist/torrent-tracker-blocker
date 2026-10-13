@@ -1,4 +1,6 @@
+import shutil
 import subprocess
+from pathlib import Path
 from typing import NoReturn
 
 import pytest
@@ -14,6 +16,7 @@ from torrent_tracker_blocker.firewall import (
 from torrent_tracker_blocker.rules import TrackerRule
 
 RULES = [TrackerRule("tcp", 6969, "46.4.109.148"), TrackerRule("udp", 80, "185.217.0.76")]
+IPV6_RULES = [TrackerRule("udp", 6969, "2a01:4f8:c17:8f74::2")]
 
 CLEAN = """\
 -P INPUT ACCEPT
@@ -64,6 +67,17 @@ COMMIT
     )
 
 
+def test_apply_script_for_ipv6_rules() -> None:
+    script = build_apply_script(CLEAN, "vpn", IPV6_RULES)
+
+    assert [line for line in script.splitlines() if line.endswith("-j DROP")] == [
+        "-A vpn-input -s 2a01:4f8:c17:8f74::2/128 -p udp -m udp --sport 6969 -j DROP",
+        "-A vpn-output -d 2a01:4f8:c17:8f74::2/128 -p udp -m udp --dport 6969 -j DROP",
+        "-A vpn-forward -d 2a01:4f8:c17:8f74::2/128 -p udp -m udp --dport 6969 -j DROP",
+    ]
+    assert "-A vpn-output -m addrtype --dst-type LOCAL -j RETURN" in script
+
+
 def test_apply_script_replaces_only_its_own_jumps() -> None:
     script = build_apply_script(INSTALLED, "vpn", RULES)
 
@@ -106,17 +120,17 @@ VERBOSE = """\
 
 
 def test_parse_status() -> None:
-    assert parse_status(VERBOSE, "vpn") == [
-        ChainStatus("vpn-input", rules=1, dropped_packets=0, is_active=True),
-        ChainStatus("vpn-output", rules=2, dropped_packets=8, is_active=True),
+    assert parse_status(VERBOSE, "vpn", 4) == [
+        ChainStatus(4, "vpn-input", rules=1, dropped_packets=0, is_active=True),
+        ChainStatus(4, "vpn-output", rules=2, dropped_packets=8, is_active=True),
         # The chain exists but FORWARD does not jump to it.
-        ChainStatus("vpn-forward", rules=1, dropped_packets=4, is_active=False),
+        ChainStatus(4, "vpn-forward", rules=1, dropped_packets=4, is_active=False),
     ]
 
 
 def test_parse_status_when_nothing_is_installed() -> None:
-    assert parse_status("-P INPUT ACCEPT -c 0 0\n", "vpn") == []
-    assert parse_status(VERBOSE, "other") == []
+    assert parse_status("-P INPUT ACCEPT -c 0 0\n", "vpn", 4) == []
+    assert parse_status(VERBOSE, "other", 6) == []
 
 
 def test_remove_script() -> None:
@@ -173,3 +187,109 @@ def test_iptables_failure_is_reported(monkeypatch: pytest.MonkeyPatch) -> None:
 
     with pytest.raises(FirewallError, match="iptables failed: Permission denied"):
         firewall.remove_rules("vpn")
+
+
+Commands = list[tuple[list[str], str | None]]
+
+
+@pytest.fixture
+def commands(monkeypatch: pytest.MonkeyPatch) -> Commands:
+    """Record every firewall command with its input; listings report an untouched firewall."""
+    calls: Commands = []
+
+    def run(command: list[str], input: str | None = None, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append((command, input))
+        return subprocess.CompletedProcess(command, 0, stdout=INSTALLED if "-S" in command else "", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    return calls
+
+
+@pytest.fixture
+def ipv6_stack(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """Pretend the host has ip6tables and an IPv6 stack; return the file that marks the stack."""
+    stack = tmp_path / "if_inet6"
+    stack.touch()
+    monkeypatch.setattr(shutil, "which", lambda command: f"/usr/sbin/{command}")
+    monkeypatch.setattr(firewall, "IPV6_STACK", stack)
+    return stack
+
+
+def test_apply_rules_updates_each_ip_version_with_its_own_rules(commands: Commands, ipv6_stack: Path) -> None:
+    firewall.apply_rules("vpn", [*RULES, *IPV6_RULES])
+
+    assert [command for command, _ in commands] == [
+        ["iptables", "-w", "-S"],
+        ["ip6tables", "-w", "-S"],
+        ["iptables-restore", "-w", "--noflush"],
+        ["ip6tables-restore", "-w", "--noflush"],
+    ]
+    ipv4_script, ipv6_script = commands[2][1], commands[3][1]
+    assert ipv4_script is not None and ipv6_script is not None
+    assert "46.4.109.148/32" in ipv4_script and "2a01:4f8" not in ipv4_script
+    assert "2a01:4f8:c17:8f74::2/128" in ipv6_script and "46.4.109.148" not in ipv6_script
+
+
+def test_apply_rules_clears_ipv6_chains_when_no_ipv6_rules_are_left(commands: Commands, ipv6_stack: Path) -> None:
+    firewall.apply_rules("vpn", RULES)
+
+    command, ipv6_script = commands[3]
+    assert command[0] == "ip6tables-restore"
+    assert ipv6_script is not None
+    assert ":vpn-output - [0:0]" in ipv6_script
+    assert "DROP" not in ipv6_script
+
+
+def test_apply_rules_skips_ipv6_without_ip6tables(
+    commands: Commands, ipv6_stack: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(shutil, "which", lambda command: None)
+
+    firewall.apply_rules("vpn", [*RULES, *IPV6_RULES])
+
+    assert [command[0] for command, _ in commands] == ["iptables", "iptables-restore"]
+    assert "IPv6 trackers are not blocked: ip6tables is not installed" in caplog.text
+    assert firewall.managed_families() == [firewall.IPV4]
+
+
+def test_apply_rules_skips_ipv6_without_a_kernel_ipv6_stack(
+    commands: Commands, ipv6_stack: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    ipv6_stack.unlink()
+
+    firewall.apply_rules("vpn", [*RULES, *IPV6_RULES])
+
+    assert [command[0] for command, _ in commands] == ["iptables", "iptables-restore"]
+    assert "IPv6 trackers are not blocked: the kernel has no IPv6 support" in caplog.text
+
+
+def test_apply_rules_is_silent_about_ipv6_when_there_is_nothing_to_block(
+    commands: Commands, ipv6_stack: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    ipv6_stack.unlink()
+
+    firewall.apply_rules("vpn", RULES)
+
+    assert caplog.text == ""
+
+
+def test_remove_rules_covers_both_ip_versions(commands: Commands, ipv6_stack: Path) -> None:
+    assert firewall.remove_rules("vpn") is True
+    assert [command[0] for command, _ in commands] == ["iptables", "ip6tables", "iptables-restore", "ip6tables-restore"]
+
+    commands.clear()
+    assert firewall.remove_rules("other") is False
+    assert [command[0] for command, _ in commands] == ["iptables", "ip6tables"]
+
+
+def test_chain_statuses_cover_both_ip_versions(monkeypatch: pytest.MonkeyPatch, ipv6_stack: Path) -> None:
+    def run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(command, 0, stdout=VERBOSE if command[0] == "iptables" else "", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", run)
+
+    assert [(status.ip_version, status.name) for status in firewall.chain_statuses("vpn")] == [
+        (4, "vpn-input"),
+        (4, "vpn-output"),
+        (4, "vpn-forward"),
+    ]

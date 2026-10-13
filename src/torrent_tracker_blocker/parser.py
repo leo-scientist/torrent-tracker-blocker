@@ -46,22 +46,23 @@ def parse_line(line: str) -> Endpoint | None:
     return Endpoint(protocol, url.hostname, port or default_port)
 
 
-def resolve_ipv4(host: str) -> list[str]:
-    """Return every IPv4 address of a host; empty if it does not resolve."""
+def resolve_host(host: str) -> list[str]:
+    """Return every IPv4 and IPv6 address of a host; empty if it does not resolve."""
     try:
-        ipaddress.IPv4Address(host)
+        return [str(ipaddress.ip_address(host))]
     except ValueError:
         pass
-    else:
-        return [host]
+
     try:
-        return socket.gethostbyname_ex(host)[2]
+        results = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
     except (OSError, UnicodeError):
         return []
 
+    return list(dict.fromkeys(str(sockaddr[0]) for *_, sockaddr in results))
+
 
 def build_rules(
-    lines: Iterable[str], resolve: Resolver = resolve_ipv4, allow_private: bool = False
+    lines: Iterable[str], resolve: Resolver = resolve_host, allow_private: bool = False
 ) -> list[TrackerRule]:
     """Parse tracker URLs and resolve them into unique rules, keeping input order."""
     endpoints: list[Endpoint] = []
@@ -85,13 +86,14 @@ def build_rules(
     blockable: dict[str, list[str]] = {}
 
     for host, ips in resolved.items():
-        blockable[host] = [ip for ip in ips if is_blockable_ip(ip, allow_private)]
+        # Canonical spelling, whatever the resolver returned.
+        blockable[host] = [str(ipaddress.ip_address(ip)) for ip in ips if is_blockable_ip(ip, allow_private)]
+        skipped = sorted(ip for ip in set(ips) if not is_blockable_ip(ip, allow_private))
 
         if not ips:
             logger.warning("Skipping %s: does not resolve", host)
 
-        elif len(blockable[host]) < len(ips):
-            skipped = sorted(set(ips) - set(blockable[host]))
+        elif skipped:
             logger.warning("Skipping unblockable addresses of %s: %s", host, ", ".join(skipped))
 
     rules = [

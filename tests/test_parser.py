@@ -3,7 +3,7 @@ from typing import NoReturn
 
 import pytest
 
-from torrent_tracker_blocker.parser import Endpoint, build_rules, parse_line, resolve_ipv4
+from torrent_tracker_blocker.parser import Endpoint, build_rules, parse_line, resolve_host
 from torrent_tracker_blocker.rules import TrackerRule
 
 DNS = {
@@ -11,6 +11,8 @@ DNS = {
     "multi.example.com": ["46.4.13.97", "5.79.209.57"],
     "sinkholed.example.com": ["127.0.0.11"],
     "mixed.example.com": ["10.0.0.1", "5.79.209.57"],
+    "dual.example.com": ["2A01:4F8:C17:8F74:0:0:0:2", "46.4.13.97"],
+    "local6.example.com": ["::1", "fe80::1%eth0", "fd00::5", "::ffff:8.8.8.8", "64:ff9b::808:808"],
 }
 
 
@@ -33,6 +35,8 @@ def fake_resolve(host: str) -> list[str]:
             Endpoint("udp", "tracker.example.com", 2710),
         ),
         ("http://80.246.243.18:6969/announce", Endpoint("tcp", "80.246.243.18", 6969)),
+        ("udp://[2A01:4F8::1]:6969/announce", Endpoint("udp", "2a01:4f8::1", 6969)),
+        ("https://[2a01:4f8::1]/announce", Endpoint("tcp", "2a01:4f8::1", 443)),
     ],
 )
 def test_parse_line(line: str, endpoint: Endpoint) -> None:
@@ -77,6 +81,31 @@ def test_build_rules_blocks_every_address_of_a_host() -> None:
     ]
 
 
+def test_build_rules_blocks_ipv6_addresses_in_canonical_spelling() -> None:
+    lines = [
+        "udp://dual.example.com:6969/announce",
+        "udp://[2a01:4f8:c17:8f74:0:0:0:2]:6969/announce",
+        "http://[2a01:4f8:c17:8f74::3]/announce",
+    ]
+
+    assert build_rules(lines, fake_resolve) == [
+        TrackerRule("udp", 6969, "2a01:4f8:c17:8f74::2"),
+        TrackerRule("udp", 6969, "46.4.13.97"),
+        TrackerRule("tcp", 80, "2a01:4f8:c17:8f74::3"),
+    ]
+
+
+def test_build_rules_skips_local_ipv6_addresses(caplog: pytest.LogCaptureFixture) -> None:
+    lines = ["udp://local6.example.com:6969/announce"]
+
+    assert build_rules(lines, fake_resolve) == []
+    assert (
+        "Skipping unblockable addresses of local6.example.com: "
+        "64:ff9b::808:808, ::1, ::ffff:8.8.8.8, fd00::5, fe80::1%eth0" in caplog.text
+    )
+    assert build_rules(lines, fake_resolve, allow_private=True) == [TrackerRule("udp", 6969, "fd00::5")]
+
+
 def test_build_rules_skips_what_cannot_be_blocked(caplog: pytest.LogCaptureFixture) -> None:
     lines = [
         "not a tracker",
@@ -110,7 +139,19 @@ def test_build_rules_allow_private_admits_private_ranges_only() -> None:
 
 @pytest.mark.parametrize(
     "host",
-    ["localhost", "127.1", "2130706433", "0x7f.0.0.1", "0177.0.0.1", "[::1]", "[::ffff:127.0.0.1]"],
+    [
+        "localhost",
+        "127.1",
+        "2130706433",
+        "0x7f.0.0.1",
+        "[::1]",
+        "[0:0:0:0:0:0:0:1]",
+        "[::ffff:127.0.0.1]",
+        "[::ffff:7f00:1]",
+        "[64:ff9b::7f00:1]",
+        "[2002:7f00:1::1]",
+        "[fe80::1]",
+    ],
 )
 def test_build_rules_cannot_be_tricked_into_blocking_loopback(host: str) -> None:
     # No fake resolver: these spellings of 127.0.0.1 go through the real one.
@@ -118,25 +159,29 @@ def test_build_rules_cannot_be_tricked_into_blocking_loopback(host: str) -> None
     assert build_rules([f"http://{host}:22/announce"], allow_private=True) == []
 
 
-def test_resolve_ipv4_returns_literal_address_without_lookup(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(socket, "gethostbyname_ex", pytest.fail)
-
-    assert resolve_ipv4("46.4.13.97") == ["46.4.13.97"]
+def test_build_rules_never_reads_an_octal_address_as_loopback() -> None:
+    # The C library decides: glibc reads the first octet as octal (127), macOS as decimal (177).
+    assert build_rules(["http://0177.0.0.1:22/announce"]) in ([], [TrackerRule("tcp", 22, "177.0.0.1")])
 
 
-def test_resolve_ipv4_returns_all_addresses(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(socket, "gethostbyname_ex", lambda host: (host, [], ["46.4.13.97", "5.79.209.57"]))
+def test_resolve_host_returns_a_literal_address_without_lookup(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(socket, "getaddrinfo", pytest.fail)
 
-    assert resolve_ipv4("multi.example.com") == ["46.4.13.97", "5.79.209.57"]
+    assert resolve_host("46.4.13.97") == ["46.4.13.97"]
+    assert resolve_host("2A01:4F8:C17:8F74:0:0:0:2") == ["2a01:4f8:c17:8f74::2"]
+
+
+def test_resolve_host_returns_all_addresses_of_both_versions(dns: dict[str, list[str]]) -> None:
+    dns["dual.example.com"] = ["2a01:4f8:c17:8f74::2", "46.4.13.97", "5.79.209.57", "46.4.13.97"]
+
+    assert resolve_host("dual.example.com") == ["2a01:4f8:c17:8f74::2", "46.4.13.97", "5.79.209.57"]
 
 
 @pytest.mark.parametrize("error", [socket.gaierror("not found"), UnicodeError("label too long")])
-def test_resolve_ipv4_returns_nothing_on_failure(monkeypatch: pytest.MonkeyPatch, error: Exception) -> None:
-    def fail(host: str) -> NoReturn:
+def test_resolve_host_returns_nothing_on_failure(monkeypatch: pytest.MonkeyPatch, error: Exception) -> None:
+    def fail(host: str, *args: object, **kwargs: object) -> NoReturn:
         raise error
 
-    monkeypatch.setattr(socket, "gethostbyname_ex", fail)
+    monkeypatch.setattr(socket, "getaddrinfo", fail)
 
-    assert resolve_ipv4("dead.example.com") == []
+    assert resolve_host("dead.example.com") == []

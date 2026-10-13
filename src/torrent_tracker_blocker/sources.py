@@ -5,6 +5,8 @@ import ipaddress
 import urllib.request
 from pathlib import Path
 
+from torrent_tracker_blocker.rules import IpNetwork
+
 MAX_SOURCE_BYTES = 1_000_000
 FETCH_TIMEOUT_SECONDS = 30
 HTTPS_PREFIX = "https://"
@@ -57,9 +59,9 @@ def read_source(source: str) -> list[str]:
         raise SourceError(f"{source}: not a UTF-8 text file") from error
 
 
-def read_networks(source: str) -> list[ipaddress.IPv4Network]:
-    """Read IPv4 addresses or CIDR ranges, one per line; ``#`` starts a comment."""
-    networks: list[ipaddress.IPv4Network] = []
+def read_networks(source: str) -> list[IpNetwork]:
+    """Read IPv4 and IPv6 addresses or CIDR ranges, one per line; ``#`` starts a comment."""
+    networks: list[IpNetwork] = []
 
     for line_number, line in enumerate(read_source(source), start=1):
         entry = line.split("#", 1)[0].strip()
@@ -67,7 +69,7 @@ def read_networks(source: str) -> list[ipaddress.IPv4Network]:
         if not entry:
             continue
         try:
-            networks.append(ipaddress.IPv4Network(entry, strict=False))
+            networks.append(ipaddress.ip_network(entry, strict=False))
         except ValueError as error:
             # A typo must not silently leave an address unprotected.
             raise SourceError(f"{source}:{line_number}: {error}") from error

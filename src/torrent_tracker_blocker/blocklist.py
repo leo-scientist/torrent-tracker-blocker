@@ -12,7 +12,7 @@ from torrent_tracker_blocker.sources import HTTPS_PREFIX, read_networks, read_so
 logger = logging.getLogger(__name__)
 
 # Cloudflare addresses are shared with a huge number of unrelated sites.
-CLOUDFLARE_RANGES = "https://www.cloudflare.com/ips-v4"
+CLOUDFLARE_RANGES = ("https://www.cloudflare.com/ips-v4", "https://www.cloudflare.com/ips-v6")
 
 
 def _download_rules(sources: Sequence[str], allow_private: bool) -> list[TrackerRule]:
@@ -34,7 +34,7 @@ def refresh_rule_file(
     allow_private: bool = False,
 ) -> bool:
     """Write a fresh rule file; False if there is nothing to block."""
-    exclude_sources = excludes if block_cloudflare else [CLOUDFLARE_RANGES, *excludes]
+    exclude_sources = excludes if block_cloudflare else [*CLOUDFLARE_RANGES, *excludes]
     networks = [network for source in exclude_sources for network in read_networks(source)]
     rules = without_excluded(_download_rules(sources, allow_private), networks)
 

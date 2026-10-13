@@ -136,16 +136,18 @@ def test_read_source_reports_a_missing_file(tmp_path: Path) -> None:
 
 def test_read_networks(tmp_path: Path) -> None:
     path = tmp_path / "exclude.txt"
-    path.write_text("# Cloudflare\n104.16.0.0/13\n\n  8.8.8.8  # DNS\n198.41.128.7/17\n")
+    path.write_text("# Cloudflare\n104.16.0.0/13\n\n  8.8.8.8  # DNS\n198.41.128.7/17\n2606:4700::/32\n2A01:4F8::5\n")
 
     assert read_networks(str(path)) == [
         ipaddress.IPv4Network("104.16.0.0/13"),
         ipaddress.IPv4Network("8.8.8.8/32"),
         ipaddress.IPv4Network("198.41.128.0/17"),
+        ipaddress.IPv6Network("2606:4700::/32"),
+        ipaddress.IPv6Network("2a01:4f8::5/128"),
     ]
 
 
-@pytest.mark.parametrize("entry", ["example.com", "8.8.8", "8.8.8.8/33", "2400:cb00::/32"])
+@pytest.mark.parametrize("entry", ["example.com", "8.8.8", "8.8.8.8/33", "2400:cb00::/129"])
 def test_read_networks_reports_the_invalid_line(tmp_path: Path, entry: str) -> None:
     path = tmp_path / "exclude.txt"
     path.write_text(f"8.8.8.8\n{entry}\n")

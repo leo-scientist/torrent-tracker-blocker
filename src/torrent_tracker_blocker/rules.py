@@ -10,9 +10,19 @@ from pathlib import Path
 PROTOCOLS = ("tcp", "udp")
 MAX_PORT = 65535
 CSV_COLUMNS = 3
+
+IpNetwork = ipaddress.IPv4Network | ipaddress.IPv6Network
+
 # Ranges that only become blockable when the operator explicitly asks for it.
-PRIVATE_NETWORKS = tuple(
-    ipaddress.IPv4Network(network) for network in ("10.0.0.0/8", "100.64.0.0/10", "172.16.0.0/12", "192.168.0.0/16")
+PRIVATE_NETWORKS: tuple[IpNetwork, ...] = tuple(
+    ipaddress.ip_network(network)
+    for network in ("10.0.0.0/8", "100.64.0.0/10", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7")
+)
+# IPv6 ranges that carry an IPv4 address inside: a rule for one of them would
+# reach an IPv4 host that none of the checks below has looked at.
+IPV4_EMBEDDING_NETWORKS = tuple(
+    ipaddress.IPv6Network(network)
+    for network in ("::/96", "::ffff:0:0/96", "64:ff9b::/96", "64:ff9b:1::/48", "2001::/32", "2002::/16")
 )
 
 
@@ -21,7 +31,7 @@ class InvalidRuleError(ValueError):
 
 
 def is_blockable_ip(ip: str, allow_private: bool = False) -> bool:
-    """Only public unicast IPv4 addresses may be blocked by default.
+    """Only public unicast IPv4 and IPv6 addresses may be blocked by default.
 
     Dead trackers often resolve to loopback or private addresses; dropping
     traffic to those would break the host or its local network. Private
@@ -29,8 +39,14 @@ def is_blockable_ip(ip: str, allow_private: bool = False) -> bool:
     are never blockable.
     """
     try:
-        address = ipaddress.IPv4Address(ip)
+        address = ipaddress.ip_address(ip)
     except ValueError:
+        return False
+
+    if isinstance(address, ipaddress.IPv6Address) and (
+        # A zone identifier is free text and has no place in a firewall rule.
+        address.scope_id is not None or any(address in network for network in IPV4_EMBEDDING_NETWORKS)
+    ):
         return False
 
     if address.is_global and not address.is_multicast:
@@ -54,13 +70,19 @@ class TrackerRule:
         if not 1 <= self.port <= MAX_PORT:
             raise InvalidRuleError(f"port {self.port} is out of range")
 
-        if not is_blockable_ip(self.ip, allow_private=True):
-            raise InvalidRuleError(f"{self.ip!r} is not a blockable IPv4 address")
+        # Only the canonical spelling, so that equal addresses always make equal rules.
+        if not is_blockable_ip(self.ip, allow_private=True) or self.ip != str(ipaddress.ip_address(self.ip)):
+            raise InvalidRuleError(f"{self.ip!r} is not a blockable IP address")
+
+    @property
+    def ip_version(self) -> int:
+        """4 or 6."""
+        return ipaddress.ip_address(self.ip).version
 
 
-def without_excluded(rules: Iterable[TrackerRule], networks: Collection[ipaddress.IPv4Network]) -> list[TrackerRule]:
+def without_excluded(rules: Iterable[TrackerRule], networks: Collection[IpNetwork]) -> list[TrackerRule]:
     """Drop the rules whose address belongs to one of the networks."""
-    return [rule for rule in rules if not any(ipaddress.IPv4Address(rule.ip) in network for network in networks)]
+    return [rule for rule in rules if not any(ipaddress.ip_address(rule.ip) in network for network in networks)]
 
 
 def read_rules(path: Path, allow_private: bool = False) -> list[TrackerRule]:
@@ -77,9 +99,10 @@ def read_rules(path: Path, allow_private: bool = False) -> list[TrackerRule]:
                     raise InvalidRuleError("expected protocol,port,ip")
 
                 protocol, port, ip = row
+                ip = str(ipaddress.ip_address(ip))
 
                 if not is_blockable_ip(ip, allow_private):
-                    raise InvalidRuleError(f"{ip!r} is not a public IPv4 address")
+                    raise InvalidRuleError(f"{ip!r} is not a public IP address")
 
                 rules.append(TrackerRule(protocol, int(port), ip))
 

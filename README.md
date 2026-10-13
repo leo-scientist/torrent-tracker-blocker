@@ -1,10 +1,10 @@
 # torrent-tracker-blocker
 
 Blocks BitTorrent trackers on a Linux host or gateway (for example a VPN server)
-with iptables.
+with iptables, over both IPv4 and IPv6.
 
 It downloads public lists of working trackers, resolves them to IP addresses
-and loads `DROP` rules for them into dedicated iptables chains. A systemd timer
+and loads `DROP` rules for them into dedicated iptables and ip6tables chains. A systemd timer
 keeps the list current. The command is called `tracker-blocker`.
 
 ## Quick start
@@ -40,8 +40,6 @@ Read these before relying on the tool:
 - **Trackers only.** Clients can still find peers through DHT, PEX and
   trackers that are not on the lists. This makes torrenting harder, not
   impossible.
-- **IPv4 only.** IPv6 addresses are neither resolved nor blocked. About half
-  of the listed trackers are also reachable over IPv6.
 - **Trackers behind Cloudflare stay reachable.** Their addresses are shared
   with a huge number of unrelated sites, so they are excluded by default; see
   `--block-cloudflare`. That is about one in seven of the listed trackers.
@@ -53,11 +51,14 @@ Read these before relying on the tool:
 - Python 3.11 - 3.14 (no third-party packages)
 - Linux with `iptables` and `iptables-restore` 1.6.2+ and root privileges for
   everything except `parse`. Both the nft and the legacy backend work.
+- `ip6tables` for IPv6. If it is not installed, or the kernel has no IPv6
+  support, only IPv4 trackers are blocked and `update` says so in a warning.
 
 On distributions that use nftables, `iptables` is the `iptables-nft` front
-end: the rules are stored in nftables (`table ip filter`) and work alongside a
-native nftables rule set or firewalld. Reloading a rule set that starts with
-`flush ruleset` removes them; run `tracker-blocker update` again afterwards.
+end: the rules are stored in nftables (`table ip filter` and
+`table ip6 filter`) and work alongside a native nftables rule set or
+firewalld. Reloading a rule set that starts with `flush ruleset` removes them;
+run `tracker-blocker update` again afterwards.
 
 Without `sudo` rights for a system-wide installation, `uv tool install .` or
 `pipx install .` also work; `sudo` then needs the full path:
@@ -100,15 +101,16 @@ daily:
 
 A tracker list has one URL per line; `http`, `https` and `udp` URLs are
 supported, and a missing port defaults to 80 (443 for `https`). Every IPv4
-address of a host becomes a rule. Lines that cannot be parsed, hosts that do
+and IPv6 address of a host becomes a rule. Lines that cannot be parsed, hosts that do
 not resolve and addresses that must not be blocked are skipped with a warning.
 To add your own trackers, pass the public lists and your file together:
 `-i https://... -i /etc/torrent-tracker-blocker/trackers.txt`.
 
-**Exclusions.** An exclusion list has one IPv4 address or CIDR range per line;
-`#` starts a comment. Lists given with `-x` are used in addition to
-Cloudflare's published ranges (<https://www.cloudflare.com/ips-v4>), which are
-always excluded unless `--block-cloudflare` is given. With that option every
+**Exclusions.** An exclusion list has one IPv4 or IPv6 address or CIDR range
+per line; `#` starts a comment. Lists given with `-x` are used in addition to
+Cloudflare's published ranges (<https://www.cloudflare.com/ips-v4> and
+<https://www.cloudflare.com/ips-v6>), which are always excluded unless
+`--block-cloudflare` is given. With that option every
 unrelated site on the same Cloudflare address and port becomes unreachable too.
 
 **Replace or merge.** By default the rule file is replaced, so trackers that
@@ -126,12 +128,16 @@ and leaves both the rule file and the firewall as they were.
 
 ```console
 $ sudo tracker-blocker status
-tracker-blocker-input: 87 rules, 0 packets dropped
-tracker-blocker-output: 87 rules, 12 packets dropped
-tracker-blocker-forward: 87 rules, 340 packets dropped
+IPv4 tracker-blocker-input: 80 rules, 0 packets dropped
+IPv4 tracker-blocker-output: 80 rules, 12 packets dropped
+IPv4 tracker-blocker-forward: 80 rules, 340 packets dropped
+IPv6 tracker-blocker-input: 32 rules, 0 packets dropped
+IPv6 tracker-blocker-output: 32 rules, 0 packets dropped
+IPv6 tracker-blocker-forward: 32 rules, 57 packets dropped
 ```
 
-The exit code is 0 only if all three chains are installed and receive traffic.
+The exit code is 0 only if all chains are installed and receive traffic: three
+for IPv4 and, where IPv6 is available, three for IPv6.
 
 ### parse and apply
 
@@ -143,15 +149,16 @@ tracker-blocker parse [the options of update, except -c] [-o trackers.csv]
 sudo tracker-blocker apply -i trackers.csv [--allow-private] [-c CHAIN]
 ```
 
-`apply` creates the chains `CHAIN-input`, `CHAIN-output` and `CHAIN-forward`,
-fills them with `DROP` rules and jumps to them from the top of `INPUT`,
-`OUTPUT` and `FORWARD`, so existing `ACCEPT` rules cannot bypass the block
-list.
+`apply` creates the chains `CHAIN-input`, `CHAIN-output` and `CHAIN-forward`
+in both iptables and ip6tables, fills them with `DROP` rules and jumps to them
+from the top of `INPUT`, `OUTPUT` and `FORWARD`, so existing `ACCEPT` rules
+cannot bypass the block list.
 
-Running it again replaces the previous rules. The whole change is a single
-`iptables-restore` transaction: an invalid rule file or an iptables error
-leaves the firewall exactly as it was, and rules outside these chains are
-never touched.
+Running it again replaces the previous rules. Each IP version is changed in a
+single `iptables-restore` transaction: an invalid rule file or an iptables
+error leaves its firewall exactly as it was, and rules outside these chains
+are never touched. IPv4 is applied first; if the IPv6 transaction then fails,
+the command reports the error and IPv6 keeps its previous rules.
 
 ## Automatic updates
 
@@ -187,11 +194,16 @@ The block list comes from third parties, so it is treated as hostile input.
 
 What a list can never do:
 
-- **Block local networks.** Only public unicast IPv4 addresses can become a
-  rule. Loopback, private (10/8, 172.16/12, 192.168/16), link-local, CGNAT,
-  multicast and reserved ranges are rejected, however they are spelled
-  (`localhost`, `127.1`, `2130706433`, a host name resolving to them). `parse`
-  skips such entries; `apply` refuses a rule file that contains one.
+- **Block local networks.** Only public unicast addresses can become a rule.
+  Loopback, private (10/8, 172.16/12, 192.168/16, fc00::/7), link-local,
+  CGNAT, multicast and reserved ranges are rejected, however they are spelled
+  (`localhost`, `127.1`, `2130706433`, `::ffff:127.0.0.1`, a host name
+  resolving to them). `parse` skips such entries; `apply` refuses a rule file
+  that contains one.
+- **Smuggle an IPv4 address inside an IPv6 one.** IPv6 addresses that embed an
+  IPv4 address (IPv4-mapped, NAT64, 6to4, Teredo) are rejected, and so is any
+  IPv6 address with a zone identifier. The price: on an IPv6-only host that
+  reaches IPv4 through NAT64, IPv4-only trackers are not blocked.
 - **Cut the host off from itself.** The chains start with a rule that returns
   early for traffic between the host and its own addresses, public ones
   included. The kernel decides what is local, so this holds for addresses
@@ -210,7 +222,7 @@ sources you trust.
 such as an ISP's `retracker.local`, has a private address. To block it, list
 it in a local file and pass `--allow-private` to `update` (or to both `parse`
 and `apply`). The option admits the private and CGNAT ranges (10/8, 172.16/12,
-192.168/16, 100.64/10) from local files only: downloaded lists can never add
+192.168/16, 100.64/10, fc00::/7) from local files only: downloaded lists can never add
 them, and loopback, link-local and the host's own addresses stay unblockable.
 
 ## Rule file format
@@ -220,13 +232,14 @@ A CSV without a header, one rule per line:
 ```
 tcp,6969,46.4.109.148
 udp,80,185.217.0.76
+udp,6969,2a01:4f8:c17:8f74::2
 ```
 
-| Column   | Value                      |
-|----------|----------------------------|
-| protocol | `tcp` or `udp`             |
-| port     | tracker port, 1-65535      |
-| ip       | public IPv4 address        |
+| Column   | Value                          |
+|----------|--------------------------------|
+| protocol | `tcp` or `udp`                 |
+| port     | tracker port, 1-65535          |
+| ip       | public IPv4 or IPv6 address    |
 
 `apply` rejects the whole file if any row is invalid.
 
@@ -238,7 +251,7 @@ uv run pytest                  # unit tests
 uv run ruff check              # lint
 uv run ruff format             # format
 uv run mypy                    # type check (strict)
-./scripts/integration-test.sh  # test against real iptables inside Docker
+./scripts/integration-test.sh  # test against real iptables and ip6tables inside Docker
 ```
 
 The integration tests rewrite the firewall of the machine they run on, so they

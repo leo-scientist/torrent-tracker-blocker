@@ -1,12 +1,11 @@
 import logging
-import socket
 from pathlib import Path
 from typing import NoReturn
 
 import pytest
 
 from torrent_tracker_blocker import blocklist, cli, sources
-from torrent_tracker_blocker.firewall import ChainStatus, FirewallError
+from torrent_tracker_blocker.firewall import IPV4, IPV6, ChainStatus, Family, FirewallError
 from torrent_tracker_blocker.rules import TrackerRule
 from torrent_tracker_blocker.sources import SourceError
 
@@ -17,21 +16,25 @@ Applied = list[tuple[str, list[TrackerRule]]]
 
 
 @pytest.fixture(autouse=True)
-def dns(monkeypatch: pytest.MonkeyPatch) -> dict[str, list[str]]:
-    hosts = {
-        "tracker.example.com": ["46.4.13.97"],
-        "other.example.com": ["5.79.209.57"],
-        "cdn.example.com": ["104.16.1.1"],
-        "retracker.local": ["10.10.0.5"],
-    }
-    monkeypatch.setattr(socket, "gethostbyname_ex", lambda host: (host, [], hosts[host]))
-    return hosts
+def dns(dns: dict[str, list[str]]) -> dict[str, list[str]]:
+    dns.update(
+        {
+            "tracker.example.com": ["46.4.13.97"],
+            "other.example.com": ["5.79.209.57"],
+            "cdn.example.com": ["104.16.1.1"],
+            "retracker.local": ["10.10.0.5"],
+            "dual.example.com": ["5.79.209.57", "2a01:4f8:c17:8f74::2"],
+            "cdn6.example.com": ["2606:4700::6810:101"],
+        }
+    )
+    return dns
 
 
 @pytest.fixture(autouse=True)
 def remote(monkeypatch: pytest.MonkeyPatch) -> Documents:
     """Serve downloadable documents by URL; an Exception value makes the download fail."""
-    documents: Documents = {blocklist.CLOUDFLARE_RANGES: b"104.16.0.0/13\n"}
+    cloudflare_ipv4, cloudflare_ipv6 = blocklist.CLOUDFLARE_RANGES
+    documents: Documents = {cloudflare_ipv4: b"104.16.0.0/13\n", cloudflare_ipv6: b"2606:4700::/32\n"}
 
     def fetch(url: str) -> bytes:
         document = documents[url]
@@ -126,13 +129,32 @@ def test_parse_excludes_cloudflare_by_default(workdir: Path) -> None:
 
 
 def test_parse_can_block_cloudflare(workdir: Path, remote: Documents) -> None:
-    del remote[blocklist.CLOUDFLARE_RANGES]  # must not even be downloaded
+    for url in blocklist.CLOUDFLARE_RANGES:
+        del remote[url]  # must not even be downloaded
     (workdir / "trackers.txt").write_text(
-        "https://cdn.example.com/announce\nhttp://tracker.example.com:6969/announce\n"
+        "https://cdn.example.com/announce\nhttps://cdn6.example.com/announce\n"
+        "http://tracker.example.com:6969/announce\n"
     )
 
     assert cli.main(["parse", "-i", "trackers.txt", "--block-cloudflare"]) == 0
-    assert (workdir / "trackers.csv").read_text() == "tcp,443,104.16.1.1\ntcp,6969,46.4.13.97\n"
+    assert (workdir / "trackers.csv").read_text() == (
+        "tcp,443,104.16.1.1\ntcp,443,2606:4700::6810:101\ntcp,6969,46.4.13.97\n"
+    )
+
+
+def test_parse_writes_ipv6_rules(workdir: Path) -> None:
+    (workdir / "trackers.txt").write_text(
+        "udp://dual.example.com:6969/announce\n"
+        "https://cdn6.example.com/announce\n"
+        "udp://[2A01:4F8:C17:8F74:0:0:0:3]:1337/announce\n"
+        "http://[2a01:4f8:c17:8f74::4]/announce\n"
+    )
+    (workdir / "own.txt").write_text("2a01:4f8:c17:8f74::4/127  # ours\n")
+
+    assert cli.main(["parse", "-i", "trackers.txt", "-x", "own.txt"]) == 0
+    assert (workdir / "trackers.csv").read_text() == (
+        "udp,6969,5.79.209.57\nudp,6969,2a01:4f8:c17:8f74::2\nudp,1337,2a01:4f8:c17:8f74::3\n"
+    )
 
 
 def test_parse_exclusions_add_to_the_default_and_cover_previous_rules(workdir: Path) -> None:
@@ -167,7 +189,7 @@ def test_parse_keeps_existing_output_when_everything_is_excluded(workdir: Path) 
     assert (workdir / "trackers.csv").read_text() == "tcp,80,5.79.209.57\n"
 
 
-@pytest.mark.parametrize("failing", [REMOTE_LIST, blocklist.CLOUDFLARE_RANGES])
+@pytest.mark.parametrize("failing", [REMOTE_LIST, *blocklist.CLOUDFLARE_RANGES])
 def test_parse_keeps_existing_output_when_a_download_fails(
     workdir: Path, remote: Documents, caplog: pytest.LogCaptureFixture, failing: str
 ) -> None:
@@ -196,11 +218,24 @@ LOCAL_ADDRESSES = (
     "udp://169.254.169.254:80/announce\n"
     "http://retracker.local/announce\n"
     "udp://192.168.1.1:53/announce\n"
+    "http://[::1]:22/announce\n"
+    "udp://[fe80::1]:6969/announce\n"
+    "udp://[::ffff:8.8.8.8]:53/announce\n"
+    "udp://[64:ff9b::808:808]:53/announce\n"
+    "udp://[fd00::5]:6969/announce\n"
 )
 
 
 def test_parse_never_writes_local_addresses(workdir: Path, dns: dict[str, list[str]]) -> None:
-    dns["tracker.example.com"] = ["127.0.0.1", "10.0.0.5", "192.168.1.1", "46.4.13.97"]
+    dns["tracker.example.com"] = [
+        "127.0.0.1",
+        "10.0.0.5",
+        "192.168.1.1",
+        "::1",
+        "fe80::1%eth0",
+        "fd00::9",
+        "46.4.13.97",
+    ]
     dns["localhost"] = ["127.0.0.1"]
     (workdir / "trackers.txt").write_text(LOCAL_ADDRESSES)
 
@@ -217,7 +252,9 @@ def test_parse_allow_private_accepts_private_ranges_from_local_files_only(
 
     args = ["parse", "-i", "trackers.txt", "-i", REMOTE_LIST, "--allow-private"]
     assert cli.main(args) == 0
-    assert (workdir / "trackers.csv").read_text() == ("tcp,22,46.4.13.97\ntcp,80,10.10.0.5\nudp,53,192.168.1.1\n")
+    assert (workdir / "trackers.csv").read_text() == (
+        "tcp,22,46.4.13.97\ntcp,80,10.10.0.5\nudp,53,192.168.1.1\nudp,6969,fd00::5\n"
+    )
 
 
 def test_parse_reports_missing_input(workdir: Path, caplog: pytest.LogCaptureFixture) -> None:
@@ -241,6 +278,10 @@ def test_apply_loads_rules_into_the_chain(workdir: Path, applied: Applied) -> No
         ("tcp,22,192.168.1.1\n", []),
         ("tcp,22,127.0.0.1\n", ["--allow-private"]),
         ("tcp,22,169.254.169.254\n", ["--allow-private"]),
+        ("udp,53,fd00::5\n", []),
+        ("tcp,22,::1\n", ["--allow-private"]),
+        ("udp,53,fe80::1\n", ["--allow-private"]),
+        ("udp,53,::ffff:8.8.8.8\n", ["--allow-private"]),
     ],
 )
 def test_apply_does_not_touch_the_firewall_without_valid_rules(
@@ -253,10 +294,17 @@ def test_apply_does_not_touch_the_firewall_without_valid_rules(
 
 
 def test_apply_allow_private_accepts_private_ranges(workdir: Path, applied: Applied) -> None:
-    (workdir / "trackers.csv").write_text("tcp,80,10.10.0.5\n")
+    (workdir / "trackers.csv").write_text("tcp,80,10.10.0.5\nudp,6969,fd00::5\n")
 
     assert cli.main(["apply", "-i", "trackers.csv", "--allow-private"]) == 0
-    assert applied == [("tracker-blocker", [TrackerRule("tcp", 80, "10.10.0.5")])]
+    assert applied == [("tracker-blocker", [TrackerRule("tcp", 80, "10.10.0.5"), TrackerRule("udp", 6969, "fd00::5")])]
+
+
+def test_apply_loads_ipv6_rules_in_any_spelling(workdir: Path, applied: Applied) -> None:
+    (workdir / "trackers.csv").write_text("udp,6969,2A01:4F8:C17:8F74:0:0:0:2\nudp,6969,2a01:4f8:c17:8f74::2\n")
+
+    assert cli.main(["apply", "-i", "trackers.csv"]) == 0
+    assert applied == [("tracker-blocker", [TrackerRule("udp", 6969, "2a01:4f8:c17:8f74::2")])]
 
 
 def test_update_downloads_and_applies(workdir: Path, applied: Applied, remote: Documents) -> None:
@@ -305,43 +353,68 @@ def test_remove_uses_the_default_chain(monkeypatch: pytest.MonkeyPatch) -> None:
     assert removed == ["tracker-blocker"]
 
 
-def test_status_reports_each_chain(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
-    statuses = [
-        ChainStatus("vpn-input", rules=87, dropped_packets=0, is_active=True),
-        ChainStatus("vpn-output", rules=87, dropped_packets=12, is_active=True),
-        ChainStatus("vpn-forward", rules=87, dropped_packets=340, is_active=True),
+def chains(ip_version: int, dropped: int = 0, forward_is_active: bool = True) -> list[ChainStatus]:
+    return [
+        ChainStatus(ip_version, "vpn-input", rules=87, dropped_packets=0, is_active=True),
+        ChainStatus(ip_version, "vpn-output", rules=87, dropped_packets=dropped, is_active=True),
+        ChainStatus(ip_version, "vpn-forward", rules=87, dropped_packets=0, is_active=forward_is_active),
     ]
-    monkeypatch.setattr(cli, "chain_statuses", lambda chain: statuses)
+
+
+@pytest.fixture
+def firewall_state(monkeypatch: pytest.MonkeyPatch) -> dict[str, list[ChainStatus] | list[Family]]:
+    """What `status` sees: the installed chains and the IP versions this host manages."""
+    state: dict[str, list[ChainStatus] | list[Family]] = {"chains": [], "families": [IPV4, IPV6]}
+    monkeypatch.setattr(cli, "chain_statuses", lambda chain: state["chains"])
+    monkeypatch.setattr(cli, "managed_families", lambda: state["families"])
+    return state
+
+
+def test_status_reports_each_chain(
+    firewall_state: dict[str, list[ChainStatus] | list[Family]], capsys: pytest.CaptureFixture[str]
+) -> None:
+    firewall_state["chains"] = [*chains(4, dropped=12), *chains(6, dropped=340)]
 
     assert cli.main(["status", "-c", "vpn"]) == 0
     assert capsys.readouterr().out == (
-        "vpn-input: 87 rules, 0 packets dropped\n"
-        "vpn-output: 87 rules, 12 packets dropped\n"
-        "vpn-forward: 87 rules, 340 packets dropped\n"
+        "IPv4 vpn-input: 87 rules, 0 packets dropped\n"
+        "IPv4 vpn-output: 87 rules, 12 packets dropped\n"
+        "IPv4 vpn-forward: 87 rules, 0 packets dropped\n"
+        "IPv6 vpn-input: 87 rules, 0 packets dropped\n"
+        "IPv6 vpn-output: 87 rules, 340 packets dropped\n"
+        "IPv6 vpn-forward: 87 rules, 0 packets dropped\n"
     )
 
 
 def test_status_fails_when_nothing_is_installed(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    firewall_state: dict[str, list[ChainStatus] | list[Family]], capsys: pytest.CaptureFixture[str]
 ) -> None:
-    monkeypatch.setattr(cli, "chain_statuses", lambda chain: [])
-
     assert cli.main(["status"]) == 1
     assert capsys.readouterr().out == "Not installed: no tracker-blocker-* chains\n"
 
 
 def test_status_fails_when_a_chain_sees_no_traffic(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    firewall_state: dict[str, list[ChainStatus] | list[Family]], capsys: pytest.CaptureFixture[str]
 ) -> None:
-    statuses = [
-        ChainStatus("vpn-input", rules=87, dropped_packets=0, is_active=True),
-        ChainStatus("vpn-output", rules=87, dropped_packets=0, is_active=True),
-        ChainStatus("vpn-forward", rules=87, dropped_packets=0, is_active=False),
-    ]
-    monkeypatch.setattr(cli, "chain_statuses", lambda chain: statuses)
+    firewall_state["chains"] = [*chains(4), *chains(6, forward_is_active=False)]
 
     assert cli.main(["status", "-c", "vpn"]) == 1
-    assert "vpn-forward: 87 rules, 0 packets dropped (inactive" in capsys.readouterr().out
+    assert "IPv6 vpn-forward: 87 rules, 0 packets dropped (inactive" in capsys.readouterr().out
+
+
+def test_status_fails_when_ipv6_is_not_covered(firewall_state: dict[str, list[ChainStatus] | list[Family]]) -> None:
+    firewall_state["chains"] = chains(4)
+
+    assert cli.main(["status", "-c", "vpn"]) == 1
+
+
+def test_status_succeeds_with_ipv4_only_on_a_host_without_ipv6(
+    firewall_state: dict[str, list[ChainStatus] | list[Family]],
+) -> None:
+    firewall_state["chains"] = chains(4)
+    firewall_state["families"] = [IPV4]
+
+    assert cli.main(["status", "-c", "vpn"]) == 0
 
 
 def test_firewall_errors_exit_with_failure(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:

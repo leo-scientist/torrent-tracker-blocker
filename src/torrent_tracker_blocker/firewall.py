@@ -1,23 +1,31 @@
-"""Sync tracker rules into dedicated iptables chains.
+"""Sync tracker rules into dedicated iptables and ip6tables chains.
 
-Every change is one ``iptables-restore --noflush`` transaction: the firewall
-ends up either fully updated or untouched, and rules outside our chains are
-never modified.
+Every change to one IP version is one ``iptables-restore --noflush``
+transaction: its firewall ends up either fully updated or untouched, and rules
+outside our chains are never modified.
 """
 
+import ipaddress
+import logging
 import re
 import shlex
+import shutil
 import subprocess
 from collections.abc import Sequence
 from dataclasses import dataclass
 from itertools import pairwise
+from pathlib import Path
 
 from torrent_tracker_blocker.rules import TrackerRule
+
+logger = logging.getLogger(__name__)
 
 BUILTIN_CHAINS = ("INPUT", "OUTPUT", "FORWARD")
 # iptables limits chain names to 28 characters; the longest suffix is "-forward".
 CHAIN_PREFIX_PATTERN = re.compile(r"[A-Za-z0-9_.-]{1,20}")
 JUMP_FLAGS = ("-j", "-g")
+# Present whenever the kernel has an IPv6 stack, even if no interface uses it.
+IPV6_STACK = Path("/proc/net/if_inet6")
 
 
 class FirewallError(Exception):
@@ -25,9 +33,23 @@ class FirewallError(Exception):
 
 
 @dataclass(frozen=True)
+class Family:
+    """An IP version and the tools that manage its firewall."""
+
+    ip_version: int
+    command: str
+    restore_command: str
+
+
+IPV4 = Family(4, "iptables", "iptables-restore")
+IPV6 = Family(6, "ip6tables", "ip6tables-restore")
+
+
+@dataclass(frozen=True)
 class ChainStatus:
     """State of one of our chains as reported by iptables."""
 
+    ip_version: int
     name: str
     rules: int
     dropped_packets: int
@@ -49,7 +71,8 @@ def _own_chains(prefix: str) -> list[str]:
 def _drop_command(builtin: str, chain: str, rule: TrackerRule) -> str:
     # INPUT sees packets coming from the tracker; OUTPUT/FORWARD see packets going to it.
     address, port = ("-s", "--sport") if builtin == "INPUT" else ("-d", "--dport")
-    return f"-A {chain} {address} {rule.ip}/32 -p {rule.protocol} -m {rule.protocol} {port} {rule.port} -j DROP"
+    host = f"{rule.ip}/{ipaddress.ip_address(rule.ip).max_prefixlen}"
+    return f"-A {chain} {address} {host} -p {rule.protocol} -m {rule.protocol} {port} {rule.port} -j DROP"
 
 
 def _jumps_to(line: str, chains: Sequence[str]) -> bool:
@@ -65,7 +88,8 @@ def _delete_jumps(current_rules: str, chains: Sequence[str]) -> list[str]:
 def build_apply_script(current_rules: str, prefix: str, rules: Sequence[TrackerRule]) -> str:
     """Build iptables-restore input that replaces our chains with the given rules.
 
-    ``current_rules`` is the output of ``iptables -S``.
+    ``current_rules`` is the output of ``iptables -S``. The same script works
+    for ip6tables when the rules are IPv6 ones.
     """
     chains = _own_chains(prefix)
     lines = ["*filter"]
@@ -104,7 +128,7 @@ def build_remove_script(current_rules: str, prefix: str) -> str | None:
     return "\n".join(["*filter", *commands, "COMMIT"]) + "\n"
 
 
-def parse_status(verbose_rules: str, prefix: str) -> list[ChainStatus]:
+def parse_status(verbose_rules: str, prefix: str, ip_version: int) -> list[ChainStatus]:
     """Describe our installed chains from the output of ``iptables -v -S``."""
     lines = [shlex.split(line) for line in verbose_rules.splitlines()]
     statuses: list[ChainStatus] = []
@@ -116,6 +140,7 @@ def parse_status(verbose_rules: str, prefix: str) -> list[ChainStatus]:
         drops = [tokens for tokens in lines if tokens[:2] == ["-A", chain] and tokens[-1] == "DROP"]
         statuses.append(
             ChainStatus(
+                ip_version=ip_version,
                 name=chain,
                 rules=len(drops),
                 # Counters are printed as "-c PACKETS BYTES".
@@ -137,30 +162,68 @@ def _run(command: list[str], stdin: str | None = None) -> str:
     return result.stdout
 
 
-def _current_rules() -> str:
-    return _run(["iptables", "-w", "-S"])
+def _ipv6_unavailable_reason() -> str | None:
+    if shutil.which(IPV6.command) is None:
+        return f"{IPV6.command} is not installed"
+
+    if not IPV6_STACK.exists():
+        return "the kernel has no IPv6 support"
+
+    return None
 
 
-def _restore(script: str) -> None:
-    _run(["iptables-restore", "-w", "--noflush"], stdin=script)
+def managed_families() -> list[Family]:
+    """Return the IP versions whose firewall can be managed on this host."""
+    return [IPV4] if _ipv6_unavailable_reason() else [IPV4, IPV6]
+
+
+def _current_rules(family: Family) -> str:
+    return _run([family.command, "-w", "-S"])
+
+
+def _restore(family: Family, script: str) -> None:
+    _run([family.restore_command, "-w", "--noflush"], stdin=script)
 
 
 def apply_rules(prefix: str, rules: Sequence[TrackerRule]) -> None:
-    """Replace any previously applied rules with the given ones."""
-    _restore(build_apply_script(_current_rules(), prefix, rules))
+    """Replace any previously applied rules with the given ones.
+
+    IPv4 and IPv6 are separate transactions, applied in that order.
+    """
+    families = managed_families()
+    reason = _ipv6_unavailable_reason()
+
+    if reason and any(rule.ip_version == IPV6.ip_version for rule in rules):
+        logger.warning("IPv6 trackers are not blocked: %s", reason)
+
+    # Read and build everything first, so that a failure there changes nothing.
+    scripts = [
+        build_apply_script(
+            _current_rules(family), prefix, [rule for rule in rules if rule.ip_version == family.ip_version]
+        )
+        for family in families
+    ]
+
+    for family, script in zip(families, scripts, strict=True):
+        _restore(family, script)
 
 
 def remove_rules(prefix: str) -> bool:
     """Remove our chains and jumps; return False if there was nothing to remove."""
-    script = build_remove_script(_current_rules(), prefix)
-    if script is None:
-        return False
+    families = managed_families()
+    scripts = [build_remove_script(_current_rules(family), prefix) for family in families]
 
-    _restore(script)
+    for family, script in zip(families, scripts, strict=True):
+        if script is not None:
+            _restore(family, script)
 
-    return True
+    return any(script is not None for script in scripts)
 
 
 def chain_statuses(prefix: str) -> list[ChainStatus]:
     """Status of each installed chain; empty if nothing is installed."""
-    return parse_status(_run(["iptables", "-w", "-v", "-S"]), prefix)
+    return [
+        status
+        for family in managed_families()
+        for status in parse_status(_run([family.command, "-w", "-v", "-S"]), prefix, family.ip_version)
+    ]
